@@ -1,5 +1,6 @@
 #include <iostream>
 #include "Algebra.h"
+#include "RecursiveFilter.h"
 
 int main() {
 
@@ -28,15 +29,11 @@ int main() {
     print_matrix(matrix, 4, 4);
 
 
-    std::cout << "\n\n";
+    std::cout << average(10) << std::endl;
+    std::cout << average(20) << std::endl;
+    std::cout << average(30) << std::endl;
 
-    float** inverse = inverse_matrix(matrix, 4);
-    if(inverse == nullptr) {
-        std::cout << "Inverse matrix is null!\n\n";
-    }
-    else {
-        print_matrix(inverse, 4, 4);
-    }
+
 
     return 0;
 }

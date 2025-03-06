@@ -7,4 +7,6 @@ add_executable(Purifier main.cpp
         KalmanFilter.cpp
         KalmanFilter.h
         Algebra.cpp
-        Algebra.h)
+        Algebra.h
+        RecursiveFilter.cpp
+        RecursiveFilter.h)
