@@ -119,7 +119,7 @@ float** matrix_multiply(float**v1, float**v2, const int i1, const int j1, const 
     float** matrix = init_matrix(i1, j2);
     for (int i=0; i<i1; i++) {
         for (int j=0; j<j2; j++) {
-            int result = 0;
+            float result = 0;
             for (int k=0; k<j1; k++) result += v1[i][k] * v2[k][j];
             matrix[i][j] = result;
         }
@@ -130,4 +130,21 @@ float** matrix_multiply(float**v1, float**v2, const int i1, const int j1, const 
 void free_matrix(float** matrix, const int rows) {
     for (int i=0; i<rows; i++) delete[] matrix[i];
     delete[] matrix;
+}
+
+
+float** matrix_add(float** v1, float** v2, const int i, const int j){
+    float** result = init_matrix(i, j);
+    for(int x=0; x < i; x++)
+        for(int y=0; y < j; y++)
+            result[x][y] = v1[x][y] + v2[x][y];
+    return result;
+}
+
+float** matrix_sub(float** v1, float** v2, const int i, const int j){
+    float** result = init_matrix(i, j);
+    for(int x=0; x < i; x++)
+        for(int y=0; y < j; y++)
+            result[x][y] = v1[x][y] - v2[x][y];
+    return result;
 }

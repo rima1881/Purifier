@@ -67,6 +67,12 @@ build CMakeFiles/Purifier.dir/Algebra.cpp.obj: CXX_COMPILER__Purifier_unscanned_
   OBJECT_DIR = CMakeFiles\Purifier.dir
   OBJECT_FILE_DIR = CMakeFiles\Purifier.dir
 
+build CMakeFiles/Purifier.dir/RecursiveFilter.cpp.obj: CXX_COMPILER__Purifier_unscanned_Debug C$:/Users/amir/Documents/Purifier/RecursiveFilter.cpp || cmake_object_order_depends_target_Purifier
+  DEP_FILE = CMakeFiles\Purifier.dir\RecursiveFilter.cpp.obj.d
+  FLAGS = -g -std=gnu++11 -fdiagnostics-color=always
+  OBJECT_DIR = CMakeFiles\Purifier.dir
+  OBJECT_FILE_DIR = CMakeFiles\Purifier.dir
+
 
 # =============================================================================
 # Link build statements for EXECUTABLE target Purifier
@@ -75,7 +81,7 @@ build CMakeFiles/Purifier.dir/Algebra.cpp.obj: CXX_COMPILER__Purifier_unscanned_
 #############################################
 # Link the executable Purifier.exe
 
-build Purifier.exe: CXX_EXECUTABLE_LINKER__Purifier_Debug CMakeFiles/Purifier.dir/main.cpp.obj CMakeFiles/Purifier.dir/KalmanFilter.cpp.obj CMakeFiles/Purifier.dir/Algebra.cpp.obj
+build Purifier.exe: CXX_EXECUTABLE_LINKER__Purifier_Debug CMakeFiles/Purifier.dir/main.cpp.obj CMakeFiles/Purifier.dir/KalmanFilter.cpp.obj CMakeFiles/Purifier.dir/Algebra.cpp.obj CMakeFiles/Purifier.dir/RecursiveFilter.cpp.obj
   FLAGS = -g
   LINK_LIBRARIES = -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32
   OBJECT_DIR = CMakeFiles\Purifier.dir

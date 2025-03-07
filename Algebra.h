@@ -27,4 +27,8 @@ void print_matrix(float** matrix, int rows, int cols);
 // returns nullptr if j1 != i2
 float** matrix_multiply(float**v1, float**v2, int i1, int j1, int i2, int j2);
 
+float** matrix_add(float** v1, float** v2, int i, int j);
+
+float** matrix_sub(float** v1, float** v2, int i, int j);
+
 #endif // ALGEBRA_H
