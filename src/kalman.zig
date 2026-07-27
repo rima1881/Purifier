@@ -1,5 +1,6 @@
 const std = @import("std");
 const maryam = @import("maryam");
+const kalman_core = @import("kalman_core.zig");
 
 pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) type {
     // 1. Matrix Type Definitions based on dimensions:
@@ -12,8 +13,7 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
     const MeasureMat   = maryam.MatrixType(m, n);
     const MeasureNoise = maryam.MatrixType(m, m);
 
-    // Derived matrix type for Kalman Gain
-    const GainMat      = maryam.MatrixType(n, m);
+    const Core = kalman_core.KalmanCore(n, m);
 
     return struct {
         const Self = @This();
@@ -29,53 +29,31 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
         H: MeasureMat,    // (m x n) Measurement transition
         R: MeasureNoise,  // (m x m) Measurement noise
 
-        // Symbolic Equations
+        // Symbolic Equations specific to the *linear* model (Core covers
+        // everything shared with other filter variants).
         const PredictX = maryam.Equation("F @ x + B @ u", struct {
             F: StateMat,
             x: StateVec,
             B: ControlMat,
             u: ControlVec,
         });
-        const PredictP = maryam.Equation("F @ P @ F^T + Q", struct {
-            F: StateMat,
-            P: StateMat,
-            Q: StateMat,
-        });
-        const InnovationS = maryam.Equation("H @ P @ H^T + R", struct {
-            H: MeasureMat,
-            P: StateMat,
-            R: MeasureNoise,
-        });
-        const KalmanGainK = maryam.Equation("P @ H^T @ S^-1", struct {
-            P: StateMat,
-            H: MeasureMat,
-            S: MeasureNoise,
-        });
-        const UpdateState = maryam.Equation("x + K @ (z - H @ x)", struct {
-            x: StateVec,
-            K: GainMat,
+        const Innovation = maryam.Equation("z - H @ x", struct {
             z: MeasureVec,
             H: MeasureMat,
-        });
-        // Joseph form
-        const UpdateP = maryam.Equation("(I - K @ H) @ P @ (I - K @ H)^T + K @ R @ K^T", struct {
-            I: StateMat,
-            K: GainMat,
-            H: MeasureMat,
-            P: StateMat,
-            R: MeasureNoise,
+            x: StateVec,
         });
 
         pub fn predict(self: *Self, u: ControlVec) void {
-            self.x = PredictX.eval(.{ .F = self.F, .x = self.x, .B = self.B, .u = u }) catch unreachable;
-            self.P = PredictP.eval(.{ .F = self.F, .P = self.P, .Q = self.Q }) catch unreachable;
+            self.x = PredictX.eval(.{ .F = self.F, .x = self.x, .B = self.B, .u = u });
+            self.P = Core.PredictP.eval(.{ .F = self.F, .P = self.P, .Q = self.Q });
         }
 
         pub fn update(self: *Self, z: MeasureVec) maryam.EvalError!void {
-            const S = try InnovationS.eval(.{ .H = self.H, .P = self.P, .R = self.R });
-            const K = try KalmanGainK.eval(.{ .P = self.P, .H = self.H, .S = S });
-            self.x = UpdateState.eval(.{ .x = self.x, .K = K, .z = z, .H = self.H }) catch unreachable;
-            self.P = UpdateP.eval(.{ .I = maryam.I(n), .K = K, .H = self.H, .P = self.P, .R = self.R }) catch unreachable;
+            const S = Core.InnovationS.eval(.{ .H = self.H, .P = self.P, .R = self.R });
+            const K = try Core.KalmanGainK.eval(.{ .S = S, .H = self.H, .P = self.P });
+            const y = Innovation.eval(.{ .z = z, .H = self.H, .x = self.x });
+            self.x = Core.ApplyGain.eval(.{ .x = self.x, .K = K, .y = y });
+            self.P = Core.UpdateP.eval(.{ .I = maryam.I(n), .K = K, .H = self.H, .P = self.P, .R = self.R });
         }
     };
 }

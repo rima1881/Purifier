@@ -25,7 +25,7 @@
     .dependencies = .{
         .maryam = .{
             .url = "https://github.com/rima1881/maryam/archive/refs/heads/main.tar.gz",
-            .hash = "maryam-0.1.0-o1DZKfKpAAB7M4zXla5qwtHYTF1fgEBmMiyqwP-1AYsR",
+            .hash = "maryam-0.2.0-o1DZKdTwAACkHa0mDyBDBUbdpP2PJ2ZQj_BBIY0j6n2p",
         },
     },
     .fingerprint = 0xa356bd57303d4217, // Changing this has security and trust implications.

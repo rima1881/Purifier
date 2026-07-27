@@ -71,7 +71,11 @@ pub fn build(b: *std.Build) void {
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
             // this package, which is why in this case we don't have to give it a name.
-            .root_source_file = b.path("src/main.zig"),
+            // examples/ is everything demonstrating how to use the library
+            // (benchmarks, specific models, the README's code examples) --
+            // it depends on the "Purifier" module the same way an external
+            // consumer would, rather than being part of the library itself.
+            .root_source_file = b.path("examples/main.zig"),
             // Target and optimization levels must be explicitly wired in when
             // defining an executable or library (in the root module), and you
             // can also hardcode a specific target for an executable or library
@@ -87,6 +91,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "Purifier", .module = mod },
+                .{ .name = "maryam", .module = maryam_dep.module("maryam") },
             },
         }),
     });
@@ -103,9 +108,9 @@ pub fn build(b: *std.Build) void {
     // For a top level step to actually do something, it must depend on other
     // steps (e.g. a Run step, as we will see in a moment).
     //
-    // Running it (see src/main.zig / src/imu_bench.zig) replays the Kalman
-    // filter against a real lidar/radar dataset and reports RMSE + speed
-    // against ground truth.
+    // Running it (see examples/main.zig / examples/imu_bench.zig) replays
+    // the Kalman filter against a real lidar/radar dataset and reports
+    // RMSE + speed against ground truth.
     const run_step = b.step("run", "Run the Kalman filter against real IMU/lidar data and report RMSE + speed");
 
     // This creates a RunArtifact step in the build graph. A RunArtifact step
