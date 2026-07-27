@@ -82,3 +82,8 @@ outside the `Equation` DSL.
 
 **Suggested change**: not urgent — flagging for later if the state/measurement
 dimensions grow.
+
+
+## 6. Have only inversion exist in equation throw an error
+Write now we have couple of unreachables in our code which is totally fine but a little bit ugly.
+It would be better to have an explicit error thrown only when inversion does exist.

@@ -41,30 +41,23 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
             P: StateMat,
             Q: StateMat,
         });
-
         const InnovationS = maryam.Equation("H @ P @ H^T + R", struct {
             H: MeasureMat,
             P: StateMat,
             R: MeasureNoise,
         });
-
         const KalmanGainK = maryam.Equation("P @ H^T @ S^-1", struct {
             P: StateMat,
             H: MeasureMat,
             S: MeasureNoise,
         });
-
         const UpdateState = maryam.Equation("x + K @ (z - H @ x)", struct {
             x: StateVec,
             K: GainMat,
             z: MeasureVec,
             H: MeasureMat,
         });
-
-        // Joseph form: numerically stable even when K isn't exactly the
-        // optimal gain (e.g. under floating-point drift) — always yields a
-        // symmetric, positive-semidefinite P, unlike the algebraically
-        // equivalent but fragile "(I - K @ H) @ P".
+        // Joseph form
         const UpdateP = maryam.Equation("(I - K @ H) @ P @ (I - K @ H)^T + K @ R @ K^T", struct {
             I: StateMat,
             K: GainMat,

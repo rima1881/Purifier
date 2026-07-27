@@ -1,5 +1,6 @@
 //! Runs the Kalman filter against a real lidar/radar dataset (synthetic but
-//! sensor-realistic) and reports RMSE against ground truth. Dataset source:
+//! sensor-realistic) and reports RMSE against ground truth, plus how fast the
+//! filter itself runs. Dataset source:
 //! https://github.com/udacity/CarND-Extended-Kalman-Filter-Project
 //!
 //! The filter here is linear, so only the "L" (lidar, direct x/y position)
@@ -7,11 +8,12 @@
 //! a nonlinear observation model and are skipped.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
-const Purifier = @import("Purifier");
+const kalman = @import("kalman.zig");
 const maryam = @import("maryam");
 
-const KF = Purifier.kalman.KalmanFilter(4, 1, 2);
+const KF = kalman.KalmanFilter(4, 1, 2);
 const StateVec = maryam.MatrixType(4, 1);
 const StateMat = maryam.MatrixType(4, 4);
 const ControlVec = maryam.MatrixType(1, 1);
@@ -56,12 +58,7 @@ fn processNoise(dt: f64, ax: f64, ay: f64) StateMat {
     return m;
 }
 
-pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const w = &stdout_file_writer.interface;
-
+pub fn run(w: *Io.Writer, io: Io) !void {
     var filter: KF = undefined;
     var initialized = false;
     var prev_t: i64 = 0;
@@ -72,6 +69,8 @@ pub fn main(init: std.process.Init) !void {
     var n_radar: usize = 0;
     var n_scored: usize = 0;
     var n_singular: usize = 0;
+    var sum_dt: f64 = 0;
+    var filter_ns: i96 = 0;
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
@@ -134,14 +133,20 @@ pub fn main(init: std.process.Init) !void {
 
         const dt: f64 = @as(f64, @floatFromInt(t - prev_t)) / 1_000_000.0;
         prev_t = t;
+        sum_dt += dt;
 
         filter.F = stateTransition(dt);
         filter.Q = processNoise(dt, 9.0, 9.0);
+
+        const t0 = Io.Timestamp.now(io, .awake);
         filter.predict(ControlVec.zero());
 
         var z = MeasureVec.zero();
         z.data = .{ .{px}, .{py} };
-        filter.update(z) catch {
+        const update_result = filter.update(z);
+        const t1 = Io.Timestamp.now(io, .awake);
+        filter_ns += t0.durationTo(t1).nanoseconds;
+        update_result catch {
             n_singular += 1;
             continue;
         };
@@ -160,6 +165,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const n: f64 = @floatFromInt(n_scored);
+    const avg_ns_per_cycle: f64 = @as(f64, @floatFromInt(filter_ns)) / n;
+    const avg_sensor_dt_ms: f64 = (sum_dt / n) * 1000.0;
+
     try w.print("dataset: {d} lidar rows, {d} radar rows (radar skipped: linear filter can't consume polar measurements)\n", .{ n_laser, n_radar });
     try w.print("scored {d} predict+update cycles (1st lidar row used only to initialize state)\n", .{n_scored});
     try w.print("singular-matrix updates skipped: {d}\n", .{n_singular});
@@ -169,6 +177,18 @@ pub fn main(init: std.process.Init) !void {
     try w.print("max |err| px={d:.4}  py={d:.4}  vx={d:.4}  vy={d:.4}\n", .{
         max_abs[0], max_abs[1], max_abs[2], max_abs[3],
     });
+    try w.print("speed: {d:.0} ns/cycle avg (predict+update only, n=4 state / m=2 measurement) -> {d:.0} cycles/sec\n", .{
+        avg_ns_per_cycle, 1_000_000_000.0 / avg_ns_per_cycle,
+    });
+    try w.print("       dataset's own sensor rate is ~{d:.1} ms/sample ({d:.0} Hz); filter has ~{d:.0}x headroom to run in real time\n", .{
+        avg_sensor_dt_ms, 1000.0 / avg_sensor_dt_ms, (avg_sensor_dt_ms * 1_000_000.0) / avg_ns_per_cycle,
+    });
+    try w.print("memory: filter struct = {d} bytes (n=4,k=1,m=2 state; no heap allocation anywhere in kalman.zig -- pure stack values)\n", .{@sizeOf(KF)});
+    if (builtin.os.tag != .windows) {
+        const ru = std.posix.getrusage(std.posix.rusage.SELF);
+        const peak_kb: i64 = if (builtin.os.tag == .macos) @divTrunc(ru.maxrss, 1024) else ru.maxrss;
+        try w.print("        process peak RSS = {d} KB (whole program: runtime + embedded dataset + filter)\n", .{peak_kb});
+    }
 
     try w.flush();
 }

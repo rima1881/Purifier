@@ -97,33 +97,16 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
-    // Runs the Kalman filter against a real lidar/radar dataset and reports
-    // RMSE against ground truth (see src/imu_bench.zig).
-    const imu_bench_exe = b.addExecutable(.{
-        .name = "imu_bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/imu_bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "Purifier", .module = mod },
-                .{ .name = "maryam", .module = maryam_dep.module("maryam") },
-            },
-        }),
-    });
-    b.installArtifact(imu_bench_exe);
-
-    const bench_run_cmd = b.addRunArtifact(imu_bench_exe);
-    bench_run_cmd.step.dependOn(b.getInstallStep());
-    const bench_step = b.step("bench", "Run the Kalman filter against real IMU/lidar data and report RMSE");
-    bench_step.dependOn(&bench_run_cmd.step);
-
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
     // For a top level step to actually do something, it must depend on other
     // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
+    //
+    // Running it (see src/main.zig / src/imu_bench.zig) replays the Kalman
+    // filter against a real lidar/radar dataset and reports RMSE + speed
+    // against ground truth.
+    const run_step = b.step("run", "Run the Kalman filter against real IMU/lidar data and report RMSE + speed");
 
     // This creates a RunArtifact step in the build graph. A RunArtifact step
     // invokes an executable compiled by Zig. Steps will only be executed by the
