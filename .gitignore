@@ -1,0 +1,10 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Claude Code local settings (per-user, not shared)
+.claude/settings.local.json
+
+# OS cruft
+.DS_Store

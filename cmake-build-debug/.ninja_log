@@ -1,5 +1,0 @@
-# ninja log v6
-68	386	7625921280075634	CMakeFiles/Purifier.dir/KalmanFilter.cpp.obj	c1f42163440b4c7f
-40	537	7626422558714388	CMakeFiles/Purifier.dir/Algebra.cpp.obj	5d644ccb1f18db6d
-44	709	7625999135537130	CMakeFiles/Purifier.dir/main.cpp.obj	917b313aa7eebcf6
-538	698	7626422563685288	Purifier.exe	cc7e0e63dc614006

@@ -1,3 +1,0 @@
-C:/Users/amir/Documents/Purifier/cmake-build-debug/CMakeFiles/Purifier.dir
-C:/Users/amir/Documents/Purifier/cmake-build-debug/CMakeFiles/edit_cache.dir
-C:/Users/amir/Documents/Purifier/cmake-build-debug/CMakeFiles/rebuild_cache.dir
