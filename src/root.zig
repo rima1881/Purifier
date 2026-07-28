@@ -11,6 +11,9 @@ const Io = std.Io;
 pub const kalman_core = @import("kalman_core.zig");
 pub const kalman = @import("kalman.zig");
 pub const extended_kalman = @import("extended_kalman.zig");
+pub const iterated_extended_kalman = @import("iterated_extended_kalman.zig");
+pub const unscented_kalman = @import("unscented_kalman.zig");
+pub const square_root_kalman = @import("square_root_kalman.zig");
 
 // Re-exported so consumers of this package can build `StateVec`/`StateMat`/
 // etc. values (`maryam.MatrixType(n, m)`) without also having to add maryam

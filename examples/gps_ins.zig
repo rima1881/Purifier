@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const maryam = @import("maryam");
+const finite_diff = @import("finite_diff.zig");
 
 pub const StateVec = maryam.MatrixType(4, 1); // [px, py, v, yaw]
 pub const StateMat = maryam.MatrixType(4, 4);
@@ -103,26 +104,6 @@ pub const GpsModel = struct {
     pub const jacobianH = Self.gpsJacobianH;
 };
 
-fn expectJacobianMatchesFiniteDifference(x: StateVec, u: ControlVec) !void {
-    const eps = 1e-6;
-    const analytic = jacobianF(x, u);
-
-    for (0..4) |j| {
-        var x_plus = x;
-        var x_minus = x;
-        x_plus.data[j][0] += eps;
-        x_minus.data[j][0] -= eps;
-
-        const f_plus = f(x_plus, u);
-        const f_minus = f(x_minus, u);
-
-        for (0..4) |i| {
-            const numeric = (f_plus.data[i][0] - f_minus.data[i][0]) / (2 * eps);
-            try std.testing.expectApproxEqAbs(numeric, analytic.data[i][j], 1e-4);
-        }
-    }
-}
-
 test "jacobianF matches finite-difference derivatives of f" {
     var x = StateVec.zero();
     x.data[0][0] = 10.0;
@@ -135,5 +116,20 @@ test "jacobianF matches finite-difference derivatives of f" {
     u.data[1][0] = 0.15; // wu
     u.data[2][0] = 0.1; // dt
 
-    try expectJacobianMatchesFiniteDifference(x, u);
+    // Same closure-binding trick as ctrv.zig's jacobianF tests: the shared
+    // helper only varies its single StateVec argument, so `u` (constant
+    // across the finite-difference step) is captured instead of threaded
+    // through as a second parameter.
+    const bound_f = struct {
+        var captured_u: ControlVec = undefined;
+        fn call(state: StateVec) StateVec {
+            return f(state, captured_u);
+        }
+        fn callJac(state: StateVec) StateMat {
+            return jacobianF(state, captured_u);
+        }
+    };
+    bound_f.captured_u = u;
+
+    try finite_diff.expectJacobianMatchesFiniteDifference(StateVec, StateVec, bound_f.call, bound_f.callJac, x);
 }

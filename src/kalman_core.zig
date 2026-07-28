@@ -9,14 +9,19 @@ const maryam = @import("maryam");
 /// evaluated at the current state each step — only *how* `F`/`H` and the
 /// state residual are produced differs between filters, not this part.
 pub fn KalmanCore(comptime n: usize, comptime m: usize) type {
-    const StateVec = maryam.MatrixType(n, 1);
-    const StateMat = maryam.MatrixType(n, n);
-    const MeasureVec = maryam.MatrixType(m, 1);
-    const MeasureMat = maryam.MatrixType(m, n);
-    const MeasureNoise = maryam.MatrixType(m, m);
-    const GainMat = maryam.MatrixType(n, m);
-
     return struct {
+        // Exposed so every filter built on top of KalmanCore(n, m) can
+        // reuse these instead of redeclaring the same six
+        // `maryam.MatrixType(...)` lines -- they used to be copy-pasted
+        // into kalman.zig/extended_kalman.zig/iterated_extended_kalman.zig/
+        // unscented_kalman.zig/square_root_kalman.zig verbatim.
+        pub const StateVec = maryam.MatrixType(n, 1);
+        pub const StateMat = maryam.MatrixType(n, n);
+        pub const MeasureVec = maryam.MatrixType(m, 1);
+        pub const MeasureMat = maryam.MatrixType(m, n);
+        pub const MeasureNoise = maryam.MatrixType(m, m);
+        pub const GainMat = maryam.MatrixType(n, m);
+
         pub const PredictP = maryam.Equation("F @ P @ F^T + Q", struct {
             F: StateMat,
             P: StateMat,
@@ -61,4 +66,20 @@ pub fn KalmanCore(comptime n: usize, comptime m: usize) type {
             R: MeasureNoise,
         });
     };
+}
+
+/// The `z - h(x)` fallback `ExtendedKalmanFilter` and `UnscentedKalmanFilter`
+/// both use when `Model` doesn't supply its own `residual` -- shared here
+/// instead of each filter declaring the same `@hasDecl(Model, "residual")`
+/// branch and default subtraction. Resolved once at comptime (returns either
+/// `Model.residual` itself or a freshly-built default function), so there's
+/// no runtime dispatch cost either way.
+pub fn defaultResidual(comptime Model: type, comptime MeasureVec: type) fn (MeasureVec, MeasureVec) MeasureVec {
+    if (@hasDecl(Model, "residual")) return Model.residual;
+
+    return struct {
+        fn call(z: MeasureVec, h_x: MeasureVec) MeasureVec {
+            return maryam.Equation("z - h_x", struct { z: MeasureVec, h_x: MeasureVec }).eval(.{ .z = z, .h_x = h_x });
+        }
+    }.call;
 }

@@ -6,6 +6,9 @@ const std = @import("std");
 const Purifier = @import("Purifier");
 const kalman = Purifier.kalman;
 const extended_kalman = Purifier.extended_kalman;
+const iterated_extended_kalman = Purifier.iterated_extended_kalman;
+const unscented_kalman = Purifier.unscented_kalman;
+const square_root_kalman = Purifier.square_root_kalman;
 const maryam = @import("maryam");
 
 test "Readme.md: linear KalmanFilter example" {
@@ -106,6 +109,171 @@ test "Readme.md: ExtendedKalmanFilter example" {
     };
 
     filter.predict(Vec1.zero()); // no control input this step
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+
+test "Readme.md: IteratedExtendedKalmanFilter example" {
+    // Same model as the EKF example above -- IteratedExtendedKalmanFilter
+    // takes the exact same Model interface, so any Model already written
+    // for the EKF works here unchanged. `max_iterations` is a 5th
+    // **comptime** parameter (not a struct field), since it's an
+    // algorithm-shape choice, not per-instance data.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const IEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(1, 1, 1, Model, 3);
+
+    var filter = IEKF{
+        .x = Vec1.zero(),
+        .P = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    filter.predict(Vec1.zero()); // no control input this step
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+
+test "Readme.md: UnscentedKalmanFilter example" {
+    // Same nonlinear measurement as the EKF example above (h(x) = sin(x)),
+    // but Model needs no Jacobians -- UKF samples f/h directly at a small
+    // set of "sigma points" instead of linearizing around the mean.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+    };
+
+    const UKF = unscented_kalman.UnscentedKalmanFilter(1, 1, 1, Model);
+
+    var filter = UKF{
+        .x = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0;
+            break :blk m;
+        },
+        .P = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    try filter.predict(Vec1.zero()); // no control input this step
+
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+
+test "Readme.md: SquareRootKalmanFilter example" {
+    // Same model and Jacobians as the ExtendedKalmanFilter example above --
+    // SquareRootKalmanFilter takes the exact same Model interface, so any
+    // Model already written for the EKF works here unchanged. The only
+    // difference is the field: `L` (a Cholesky factor of P, P = L @ L^T)
+    // instead of `P` itself.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const SRKF = square_root_kalman.SquareRootKalmanFilter(1, 1, 1, Model);
+
+    var filter = SRKF{
+        .x = Vec1.zero(),
+        .L = blk: { // P = L @ L^T = 1, same starting uncertainty as the EKF example
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    try filter.predict(Vec1.zero()); // no control input this step
     var z = Vec1.zero();
     z.data[0][0] = 0.5; // measured sin(x) = 0.5
     try filter.update(z);

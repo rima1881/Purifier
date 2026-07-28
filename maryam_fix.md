@@ -9,6 +9,13 @@ the "RESOLVED" items. Purifier is now pinned to 0.2.0
 (`build.zig.zon`) and `kalman.zig`'s Kalman-gain equation was rewritten to
 `"(S^-1 @ (H @ P))^T"` to take advantage of the new solve-fusion (item 2).
 
+**Update (past 0.2.0, unreleased on `main`)**: `choleskyMatrix`/`sqrtMatrix`
+landed (item 8) — the matrix-square-root primitive UKF/SR-KF were blocked
+on. Purifier is pinned to this commit too (same version string, `0.2.0`,
+since upstream hasn't bumped it for this addition yet). Both `unscented_kalman.zig`
+and `square_root_kalman.zig` are now implemented on top of it — see item 9
+for the primitive SR-KF's own next step is blocked on.
+
 ## 1. Hardcoded `f64` — blocks the original Arduino target (open)
 
 `MatrixType(rows, cols)` always stores `[rows][cols]f64`
@@ -66,13 +73,46 @@ adding this dependency will hit: `zig fetch --save git+https://github.com/...`
 fails with `error: unable to discover remote git server capabilities:
 HttpConnectionClosing` — reproduced even fetching Zig's own repo tarball, so
 it's a bug/quirk in Zig 0.16's `std.http.Client`, not this network or this
-package. Workaround used here (twice now, for 0.1.0 and 0.2.0): fetch the
-tarball with any other HTTP client, then `zig fetch --save
-file:///path/to/tarball.tar.gz` (hash is computed from content, so the
-resulting `build.zig.zon` entry is valid once the `url` is edited back to the
-real GitHub URL).
+package. Workaround used here (three times now, for 0.1.0, 0.2.0, and this
+post-0.2.0 commit): fetch the tarball with any other HTTP client, then `zig
+fetch --save file:///path/to/tarball.tar.gz` (hash is computed from content,
+so the resulting `build.zig.zon` entry is valid once the `url` is edited
+back to the real GitHub URL).
 
 **Suggested change**: nothing to fix in maryam's code, but the README's
 install section could mention this known failure mode and the tarball
 workaround, since anyone hitting it will otherwise assume the package itself
 is broken.
+
+## 8. RESOLVED — matrix square root / Cholesky exposed
+
+`operation.choleskyMatrix(T, a)` (standard Cholesky, `a = L @ L^T`, `null` if
+`a` isn't SPD) and `operation.sqrtMatrix(T, a)` (general matrix square root
+via Denman-Beavers iteration, backing the equation DSL's new `^0.5` syntax)
+are both public now. This was the specific gap blocking UKF (sigma points
+need `sqrt((n+lambda)*P)`) and SR-KF (propagates a Cholesky factor of `P`
+directly) on the Filters checklist in `Readme.md` — both are now implemented
+(`unscented_kalman.zig`, `square_root_kalman.zig`).
+
+## 9. No QR decomposition — blocks a "true" square-root filter (open)
+
+`square_root_kalman.zig` (`SquareRootKalmanFilter`) propagates a Cholesky
+factor `L` of `P` as its persistent state, but internally still
+reconstructs `P = L @ L^T` every `predict()`/`update()` to run the ordinary
+Joseph-form recursion, then re-factors the result back into `L`. That gets a
+real benefit (every step's `P` is validated as genuinely SPD, or the filter
+reports `error.NotPositiveDefinite` immediately) but not the classical
+square-root technique's actual point: a "true" square-root filter (Potter/
+Carlson/Bierman form) never re-forms `P` at all, instead propagating `L`
+directly through a **QR decomposition** — e.g. predict's `L' = qr([F @ L |
+Q^0.5]^T)`'s upper-triangular factor, transposed — which keeps the working
+condition number at `cond(L)` instead of `cond(P) = cond(L)^2`. Verified by
+hand-implementing this exact recursion in Python (transcribed from
+filterpy's `square_root.py`, which does use `scipy.linalg.qr`) for both
+benchmark models — see `Readme.md`'s SR-KF validation notes.
+
+**Suggested change**: expose a QR (or just Householder-reflection)
+decomposition primitive, e.g. `operation.qrMatrix(T, a) -> struct { q: T, r:
+T }`. Would let `SquareRootKalmanFilter` (and a future square-root UKF,
+sidestepping *its* Joseph-form-adjacent weak spot noted in
+`unscented_kalman.zig`) drop the `P = L @ L^T` round-trip entirely.

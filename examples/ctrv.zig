@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const maryam = @import("maryam");
+const finite_diff = @import("finite_diff.zig");
 
 pub const StateVec = maryam.MatrixType(5, 1); // [px, py, v, yaw, yaw_rate]
 pub const StateMat = maryam.MatrixType(5, 5);
@@ -243,31 +244,6 @@ pub const RadarModel = struct {
     pub const residual = Self.radarResidual;
 };
 
-fn expectJacobianMatchesFiniteDifference(
-    comptime OutVec: type,
-    func: *const fn (StateVec) OutVec,
-    jac: *const fn (StateVec) maryam.MatrixType(OutVec.nrows, 5),
-    x: StateVec,
-) !void {
-    const eps = 1e-6;
-    const analytic = jac(x);
-
-    for (0..5) |j| {
-        var x_plus = x;
-        var x_minus = x;
-        x_plus.data[j][0] += eps;
-        x_minus.data[j][0] -= eps;
-
-        const f_plus = func(x_plus);
-        const f_minus = func(x_minus);
-
-        for (0..OutVec.nrows) |i| {
-            const numeric = (f_plus.data[i][0] - f_minus.data[i][0]) / (2 * eps);
-            try std.testing.expectApproxEqAbs(numeric, analytic.data[i][j], 1e-4);
-        }
-    }
-}
-
 test "radarJacobianH matches finite-difference derivatives of radarH" {
     var x = StateVec.zero();
     x.data[0][0] = 120.0; // px
@@ -276,7 +252,7 @@ test "radarJacobianH matches finite-difference derivatives of radarH" {
     x.data[3][0] = 0.7; // yaw
     x.data[4][0] = 0.05; // yaw_rate (unused by radarH, kept nonzero to be realistic)
 
-    try expectJacobianMatchesFiniteDifference(RadarVec, radarH, radarJacobianH, x);
+    try finite_diff.expectJacobianMatchesFiniteDifference(StateVec, RadarVec, radarH, radarJacobianH, x);
 }
 
 test "jacobianF matches finite-difference derivatives of f, turning case" {
@@ -299,7 +275,7 @@ test "jacobianF matches finite-difference derivatives of f, turning case" {
     };
     bound_f.captured_dt = dt;
 
-    try expectJacobianMatchesFiniteDifference(StateVec, bound_f.call, bound_f.callJac, x);
+    try finite_diff.expectJacobianMatchesFiniteDifference(StateVec, StateVec, bound_f.call, bound_f.callJac, x);
 }
 
 test "jacobianF matches finite-difference derivatives of f, near-straight-line case" {
@@ -322,7 +298,7 @@ test "jacobianF matches finite-difference derivatives of f, near-straight-line c
     };
     bound_f.captured_dt = dt;
 
-    try expectJacobianMatchesFiniteDifference(StateVec, bound_f.call, bound_f.callJac, x);
+    try finite_diff.expectJacobianMatchesFiniteDifference(StateVec, StateVec, bound_f.call, bound_f.callJac, x);
 }
 
 test "radarResidual wraps the bearing across the +-pi branch cut" {

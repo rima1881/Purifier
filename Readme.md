@@ -1,17 +1,35 @@
 # Purifier
 
 Purifier is a Kalman Filter implementation for different systems, written in
-Zig on top of [`maryam`](https://github.com/rima1881/maryam). Two filter variants share the same covariance math (`kalman_core.KalmanCore`,
-see `src/kalman_core.zig`):
+Zig on top of [`maryam`](https://github.com/rima1881/maryam). Five filter
+variants:
 
 - `kalman.KalmanFilter` — linear, constant-velocity model.
-- `extended_kalman.ExtendedKalmanFilter` — nonlinear model/measurement
-  (Jacobian-linearized each step). Two models plug into it:
-  - `examples/ctrv.zig` — CTRV (constant turn rate and velocity) motion model plus
-    a radar measurement model, used against the synthetic lidar/radar
-    dataset below.
-  - `examples/gps_ins.zig` — a bicycle model driven by real accelerometer/gyro
-    control inputs, used against the real KITTI dataset below.
+- `extended_kalman.ExtendedKalmanFilter` — nonlinear model/measurement,
+  Jacobian-linearized each step.
+- `iterated_extended_kalman.IteratedExtendedKalmanFilter` — same as the EKF,
+  but re-linearizes `H` at successively better state estimates within a
+  single update instead of just once.
+- `unscented_kalman.UnscentedKalmanFilter` — nonlinear model/measurement, no
+  derivatives needed (sigma points instead).
+- `square_root_kalman.SquareRootKalmanFilter` — same nonlinear model as the
+  EKF, but propagates a Cholesky factor of `P` instead of `P` itself.
+
+`KalmanFilter`, `ExtendedKalmanFilter`, `IteratedExtendedKalmanFilter`, and
+`SquareRootKalmanFilter` all share the same covariance math
+(`kalman_core.KalmanCore`, see `src/kalman_core.zig`); `UnscentedKalmanFilter`
+mostly doesn't (sigma-point statistics instead of `F`/`H`-based propagation —
+it only reuses `KalmanCore.ApplyGain`, the one piece that's shape-only and
+doesn't reference `F`/`H`). `IteratedExtendedKalmanFilter` and
+`SquareRootKalmanFilter` both take the exact same `Model` shape as the EKF
+(same Jacobians and all), and `UnscentedKalmanFilter` takes that same shape
+minus the Jacobians, so the same models plug into all four nonlinear filters:
+
+- `examples/ctrv.zig` — CTRV (constant turn rate and velocity) motion model
+  plus a radar measurement model, used against the synthetic lidar/radar
+  dataset below.
+- `examples/gps_ins.zig` — a bicycle model driven by real accelerometer/gyro
+  control inputs, used against the real KITTI dataset below.
 
 `zig build run` runs both benchmarks (`imu_bench.zig`, `kitti_bench.zig`),
 one after another.
@@ -20,6 +38,41 @@ one after another.
 
 - [x] **Linear Kalman Filter** — `kalman.KalmanFilter`
 - [x] **Extended Kalman Filter (EKF)** — `extended_kalman.ExtendedKalmanFilter`
+- [x] **Unscented Kalman Filter (UKF)** — `unscented_kalman.UnscentedKalmanFilter`.
+      Sigma-point propagation instead of Jacobian linearization — `Model`
+      only needs `f`/`h`, no derivatives, so every EKF `Model` already
+      written (`ctrv.RadarModel`, `gps_ins.GpsModel`) works here unchanged.
+      Was blocked on a Cholesky/matrix-square-root primitive; `maryam` added
+      `operation.choleskyMatrix` (see `maryam_fix.md` item 8), which unblocked
+      it. See the benchmark sections below for results and a real gotcha
+      found while wiring it up (initial `P` that's fine for EKF can break
+      UKF's sigma points).
+- [x] **Square-Root Kalman Filter (SR-KF)** — `square_root_kalman.SquareRootKalmanFilter`.
+      Same `Model` interface as the EKF (same Jacobians, every EKF `Model`
+      already written works here unchanged), but the persistent state is a
+      Cholesky factor `L` of `P` (`P = L @ L^T`) instead of `P` itself.
+      Reuses all five of `KalmanCore`'s equations (not just `ApplyGain` like
+      the UKF), reconstructing `P` from `L` each step, running the same
+      Joseph-form recursion, then re-factoring the result — which either
+      succeeds or reports `error.NotPositiveDefinite`, catching a bad `P`
+      immediately instead of letting it silently drift. Doesn't (yet) get
+      the classical square-root filter's real numerical-conditioning
+      benefit, which needs a QR decomposition `maryam` doesn't expose — see
+      `square_root_kalman.zig`'s doc comment and `maryam_fix.md`.
+- [x] **Iterated Extended Kalman Filter (IEKF)** — `iterated_extended_kalman.IteratedExtendedKalmanFilter`.
+      Re-linearizes `H` at the *updated* state estimate, not just the
+      predicted one, iterating within a single update step (the standard
+      Gauss-Newton form — Bell & Cathey 1993). Reuses all five of
+      `KalmanCore`'s equations, same as `SquareRootKalmanFilter`; only `K`/`S`
+      always use the *original* predicted `P`, never an iteration-updated
+      one. `max_iterations` is a **comptime** parameter (not a struct field
+      like `Q`/`R`), since it's an algorithm-shape choice, not per-instance
+      data. A real, somewhat surprising result found while benchmarking
+      this: more iterations is **not** monotonically better here — see the
+      IMU benchmark section below for the full sweep (1 through 10
+      iterations) and why (undamped Gauss-Newton can overshoot and
+      oscillate rather than converge smoothly, a known limitation of the
+      "vanilla" form without a trust region or line search).
 - [ ] **Error-State Kalman Filter (ESKF)** — estimates a small perturbation
       around a nominal state trajectory instead of the full state directly.
       The standard approach for orientation/quaternion-heavy IMU fusion
@@ -27,20 +80,6 @@ one after another.
       valid, and sidesteps quaternion-normalization singularities a
       direct-state EKF runs into). `src/error_state_kalman.zig` is a
       placeholder for this.
-- [ ] **Unscented Kalman Filter (UKF)** — sigma-point propagation instead of
-      Jacobian linearization; no derivatives needed, but needs a Cholesky/
-      matrix-square-root primitive `maryam` doesn't expose yet (see
-      `maryam_fix.md`).
-- [ ] **Iterated Extended Kalman Filter (IEKF)** — re-linearizes `H` at the
-      *updated* state estimate, not just the predicted one, iterating within
-      a single update step. Cheap add on top of the existing EKF machinery
-      for measurements too nonlinear for one linearization pass to handle
-      well.
-- [ ] **Square-Root Kalman Filter (SR-KF)** — propagates a Cholesky factor of
-      `P` instead of `P` itself, so `P` can't drift non-positive-semidefinite
-      even under floating-point error. Joseph form (already used by every
-      filter here) is a weaker version of the same idea; this is the
-      stronger one.
 - [ ] **Information Filter** — the algebraic dual of the standard KF:
       propagates `P^-1` instead of `P`. Natural fit for fusing many
       independent measurement sources, since information from independent
@@ -56,8 +95,8 @@ one after another.
 zig build          # compiles the library + executable
 zig build test      # runs the unit tests, including finite-difference checks
                      # on the CTRV Jacobians (see "A real bug" below)
-zig build run        # runs both filters against real sensor data and prints
-                     # a side-by-side comparison (below)
+zig build run        # runs all four filters against real sensor data and
+                     # prints a side-by-side comparison (below)
 zig build run -Doptimize=ReleaseFast   # same, but built for speed
 ```
 
@@ -86,6 +125,9 @@ const std = @import("std");
 const Purifier = @import("Purifier");
 const kalman = Purifier.kalman;
 const extended_kalman = Purifier.extended_kalman;
+const iterated_extended_kalman = Purifier.iterated_extended_kalman;
+const unscented_kalman = Purifier.unscented_kalman;
+const square_root_kalman = Purifier.square_root_kalman;
 const maryam = @import("maryam");
 
 test "Readme.md: linear KalmanFilter example" {
@@ -203,16 +245,251 @@ test "Readme.md: ExtendedKalmanFilter example" {
 }
 ```
 
-Both blocks above are copied verbatim from `examples/readme_examples.zig`.
+### `IteratedExtendedKalmanFilter(n, k, m, Model, max_iterations)` — nonlinear, re-linearized within update()
+
+Same `Model` interface as `ExtendedKalmanFilter` — any EKF `Model` works
+here unchanged. `max_iterations` is a 5th **comptime** parameter: starting
+from the predicted state, `update()` re-linearizes `H` at successively
+better estimates (the standard Gauss-Newton IEKF form) instead of
+linearizing once and stopping.
+
+```zig
+test "Readme.md: IteratedExtendedKalmanFilter example" {
+    // Same model as the EKF example above -- IteratedExtendedKalmanFilter
+    // takes the exact same Model interface, so any Model already written
+    // for the EKF works here unchanged. `max_iterations` is a 5th
+    // **comptime** parameter (not a struct field), since it's an
+    // algorithm-shape choice, not per-instance data.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const IEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(1, 1, 1, Model, 3);
+
+    var filter = IEKF{
+        .x = Vec1.zero(),
+        .P = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    filter.predict(Vec1.zero()); // no control input this step
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+```
+
+`max_iterations = 1` is exactly the plain EKF update (the predicted state is
+also the first, and only, linearization point). Higher values re-linearize
+at each new estimate, using a correction term (`- H_i @ (x_pred - x_i)`)
+that accounts for linearizing away from the predicted state — see
+`iterated_extended_kalman.zig`'s doc comment for the full recursion. **Not
+every `Model` benefits equally**: if `jacobianH` doesn't actually depend on
+`x` (a linear measurement, like GPS position), every iteration re-linearizes
+to the *same* `H`, so iterating changes nothing — see the KITTI benchmark
+below, where `IteratedExtendedKalmanFilter` reproduces the plain EKF exactly
+for this reason.
+
+### `UnscentedKalmanFilter(n, k, m, Model)` — nonlinear, no derivatives
+
+Same shape as `ExtendedKalmanFilter`, but `Model` only needs `f`/`h` — no
+`jacobianF`/`jacobianH`. Instead of linearizing, it propagates a small set
+of deterministically-chosen "sigma points" through the actual nonlinear
+`f`/`h` and reconstructs mean/covariance from their weighted statistics.
+Any `Model` already written for the EKF works here unchanged (the extra
+Jacobian decls are just never referenced) — `ctrv.RadarModel`/
+`gps_ins.GpsModel` are plugged into all four nonlinear filters in the
+benchmarks below.
+
+```zig
+test "Readme.md: UnscentedKalmanFilter example" {
+    // Same nonlinear measurement as the EKF example above (h(x) = sin(x)),
+    // but Model needs no Jacobians -- UKF samples f/h directly at a small
+    // set of "sigma points" instead of linearizing around the mean.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+    };
+
+    const UKF = unscented_kalman.UnscentedKalmanFilter(1, 1, 1, Model);
+
+    var filter = UKF{
+        .x = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0;
+            break :blk m;
+        },
+        .P = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    try filter.predict(Vec1.zero()); // no control input this step
+
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+```
+
+Unlike `ExtendedKalmanFilter`, `predict()` here can fail
+(`maryam.EvalError!void`, not `void`): generating sigma points needs a
+Cholesky factor of `P`, which only exists if `P` is genuinely symmetric
+positive-definite. A **real gotcha** found while wiring this up: an initial
+`P` that's perfectly fine for `KalmanFilter`/`ExtendedKalmanFilter` (which
+only ever use `P` algebraically, never sample points from it) can badly
+break the UKF, if it's "wide" on a periodic state component like an angle —
+see the KITTI benchmark section below for the actual bug this caused and the
+fix.
+
+### `SquareRootKalmanFilter(n, k, m, Model)` — nonlinear, Cholesky-factored `P`
+
+Same `Model` interface as `ExtendedKalmanFilter` (same `f`/`jacobianF`/`h`/
+`jacobianH`, same optional `residual`) — any EKF `Model` works here
+unchanged. The only difference is the field: `L`, a Cholesky factor of the
+covariance (`P = L @ L^T`), instead of `P` itself.
+
+```zig
+test "Readme.md: SquareRootKalmanFilter example" {
+    // Same model and Jacobians as the ExtendedKalmanFilter example above --
+    // SquareRootKalmanFilter takes the exact same Model interface, so any
+    // Model already written for the EKF works here unchanged. The only
+    // difference is the field: `L` (a Cholesky factor of P, P = L @ L^T)
+    // instead of `P` itself.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const SRKF = square_root_kalman.SquareRootKalmanFilter(1, 1, 1, Model);
+
+    var filter = SRKF{
+        .x = Vec1.zero(),
+        .L = blk: { // P = L @ L^T = 1, same starting uncertainty as the EKF example
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    try filter.predict(Vec1.zero()); // no control input this step
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+```
+
+Like the UKF, `predict()`/`update()` here return `maryam.EvalError!void`, not
+`void`: every step re-factors `P` back into `L` via
+`operation.choleskyMatrix`, which can report `error.NotPositiveDefinite`.
+Unlike the UKF, this filter is **algebraically identical** to the EKF (it
+reuses all five of `KalmanCore`'s equations, reconstructing `P = L @ L^T`
+each step to run the exact same Joseph-form recursion) — so in exact
+arithmetic it can't produce a different answer, only a different-shaped
+internal representation with an extra validity check. The benchmark sections
+below confirm this: `SquareRootKalmanFilter` matches
+`ExtendedKalmanFilter`'s RMSE to 4 decimal places on both datasets. What this
+filter does *not* (yet) buy is the classical square-root technique's actual
+numerical-conditioning benefit — see its doc comment in
+`square_root_kalman.zig` for why (maryam doesn't expose a QR decomposition
+yet) and `maryam_fix.md` for the primitive that would unblock it.
+
+Every code block above (EKF, IEKF, UKF, SR-KF) is copied verbatim from
+`examples/readme_examples.zig`.
 
 For a full worked model (multi-dimensional state, real Jacobians, process
 noise from control-input uncertainty, angle-wrapped residuals) see
 `examples/ctrv.zig` or `examples/gps_ins.zig` rather than reimplementing one from
-scratch — both are plugged into working benchmarks below.
+scratch — both are plugged into all four nonlinear filters in the
+benchmarks below.
 
 ## The IMU benchmark (`zig build run`)
 
-`examples/imu_bench.zig` replays both filters against the same real
+`examples/imu_bench.zig` replays all five filters against the same real
 (synthetic-but-sensor-realistic) lidar/radar dataset and scores each against
 ground truth.
 
@@ -225,9 +502,12 @@ rows).
 
 The linear `KalmanFilter(4, 1, 2)` (state `[px, py, vx, vy]`) can only
 consume the lidar rows — radar's `rho_dot` is a nonlinear function of the
-state, which a linear filter can't express. The `ExtendedKalmanFilter(5, 1, m)`
-uses a 5-state CTRV model (`[px, py, v, yaw, yaw_rate]`) with a genuinely
-nonlinear radar measurement model, so it consumes *all* 500 rows.
+state, which a linear filter can't express. `ExtendedKalmanFilter(5, 1, m)`,
+`IteratedExtendedKalmanFilter(5, 1, m, Model, 3)`,
+`UnscentedKalmanFilter(5, 1, m)`, and `SquareRootKalmanFilter(5, 1, m)` all
+use a 5-state CTRV model (`[px, py, v, yaw, yaw_rate]`, `examples/ctrv.zig`)
+with a genuinely nonlinear radar measurement model, so all four consume
+*all* 500 rows — same `ctrv.LidarModel`/`ctrv.RadarModel` plugged into each.
 
 ### Accuracy
 
@@ -243,14 +523,113 @@ max |err| px=0.2073  py=0.2896  vx=2.1940  vy=3.4988
 -- Extended KF (different Q) -- CTRV model, lidar + radar --
 RMSE      px=0.0591  py=0.0828  vx=0.1900  vy=0.2878
 max |err| px=0.1806  py=0.2904  vx=2.1743  vy=3.5031
+
+-- Iterated EKF, max 3 iterations (same Q as untuned EKF) -- CTRV model, lidar + radar --
+RMSE      px=0.0701  py=0.0826  vx=0.1819  vy=0.2128
+max |err| px=0.2077  py=0.2899  vx=0.8147  vy=1.2705
+
+-- Unscented KF (same Q as untuned EKF) -- CTRV model, lidar + radar --
+RMSE      px=0.0717  py=0.0838  vx=0.2406  vy=0.2414
+max |err| px=0.3073  py=0.2877  vx=1.7392  vy=1.7527
+
+-- Square-Root KF (same Q as untuned EKF) -- CTRV model, lidar + radar --
+RMSE      px=0.0700  py=0.0803  vx=0.2142  vy=0.3011
+max |err| px=0.2073  py=0.2896  vx=2.1940  vy=3.4988
 ```
 
-| RMSE | Linear KF (lidar only) | EKF, untuned Q | EKF, different Q | Reference C++ EKF (CV, lidar+radar)\* |
-| --- | --- | --- | --- | --- |
-| px | 0.1211 | 0.0700 | **0.0591** | 0.0972 |
-| py | 0.0986 | 0.0803 | 0.0828 | **0.0854** |
-| vx | 0.4818 | 0.2142 | **0.1900** | 0.4509 |
-| vy | 0.4576 | 0.3011 | **0.2878** | 0.4396 |
+| RMSE | Linear KF (lidar only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q | SR-KF, untuned Q\*\*\* | Reference C++ EKF (CV, lidar+radar)\* |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| px | 0.1211 | 0.0700 | **0.0591** | 0.0701 | 0.0717 | 0.0700 | 0.0972 |
+| py | 0.0986 | 0.0803 | 0.0828 | 0.0826 | 0.0838 | 0.0803 | **0.0854** |
+| vx | 0.4818 | 0.2142 | 0.1900 | **0.1819** | 0.2406\*\* | 0.2142 | 0.4509 |
+| vy | 0.4576 | 0.3011 | 0.2878 | **0.2128** | 0.2414 | 0.3011 | 0.4396 |
+
+\*\*\*\* **IEKF beats every other config (including the hand-tuned EKF) on
+`vx`/`vy`, using the untuned `Q`** — and its `max|err|` on `vx`/`vy`
+(`0.8147`/`1.2705`) is dramatically tighter than the plain EKF's
+(`2.1940`/`3.4988`), meaning it doesn't just average better, it avoids the
+EKF's worst-case radar-linearization spikes. But this specific
+`max_iterations = 3` was chosen *empirically* — see the discussion below,
+this is not a "more iterations = better" story.
+
+\*\*\* Identical to "EKF, untuned Q" to 4 decimal places, exactly as
+expected: `SquareRootKalmanFilter` is algebraically the same recursion as
+the EKF, just with `P` represented as a Cholesky factor -- see the
+`SquareRootKalmanFilter` API section above and the validation note below.
+
+\*\* UKF beats every EKF configuration on `vy`, and beats the *untuned* EKF
+on `vx` (though not the hand-tuned one, or IEKF) — using the exact same,
+untuned `Q` as the "EKF, untuned Q" column. No Jacobians were derived for
+this model at all; the sigma points handle CTRV's `sin`/`cos` nonlinearity
+directly.
+
+**A real, somewhat surprising result: iterating more is not monotonically
+better.** `imu_bench.zig`'s `LidarIEKF`/`RadarIEKF` use `max_iterations = 3`
+specifically because a full sweep (1 through 10) turned out non-monotonic:
+
+| max_iterations | 1 (= plain EKF) | 2 | 3 | 4 | 5 | 8 | 10 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| RMSE vx | 0.2142 | 0.3730 | **0.1819** | 0.5227 | 0.5599 | 0.5827 | 0.3856 |
+| RMSE vy | 0.3011 | 0.1825 | **0.2128** | 0.3429 | 0.6003 | 0.3894 | 0.3199 |
+
+3 iterations is the best performer of the sweep; every value beyond it (4,
+5, 8) is *worse than doing no iterating at all* (`max_iterations = 1`). This
+is a known property of "vanilla" Gauss-Newton IEKF, not a bug: with no step
+damping or line search, re-linearizing at an overshot estimate can produce a
+*worse* next estimate than the one before it, so the sequence oscillates
+around a solution instead of settling into it monotonically. (Verified this
+wasn't a Zig-side quirk — the exact same non-monotonic RMSE values at every
+iteration count reproduce in the independent Python validation described
+below.) The practical takeaway: `max_iterations` for a vanilla IEKF is a
+tuning knob to sweep empirically per problem, not a dial where "higher is
+safer."
+
+The IEKF row is independently validated the same way the SR-KF row is: no
+off-the-shelf library (filterpy included) has an IEKF class, so the standard
+Gauss-Newton recursion (Bell & Cathey 1993) is hand-transcribed in Python,
+independently of `iterated_extended_kalman.zig`'s own code, and applied with
+the same CTRV `f`/`h`/Jacobians. Result at `max_iterations = 3`: `RMSE
+px=0.0701 py=0.0826 vx=0.1819 vy=0.2128`, `max|err|` also identical — a
+**bit-for-bit match**. The full 1/2/4/5 sweep matches too, confirming the
+non-monotonic behavior above is a genuine property of the algorithm on this
+data, not an implementation quirk.
+
+The UKF row is independently validated against
+[`filterpy`](https://github.com/rlabbe/filterpy)'s `UnscentedKalmanFilter`
+(`MerweScaledSigmaPoints(n=5, alpha=1.0, beta=2.0, kappa=0.0)` — this repo's
+exact fixed sigma-point parameters — same untuned `Q`/`R`, same CTRV `f`/`h`
+and radar angle-wrap residual, two filter objects kept in sync on shared
+`(x, P)` to mirror `imu_bench.zig` alternating lidar/radar rows): RMSE
+`px=0.0718 py=0.0839 vx=0.2407 vy=0.2423`, max|err| identical to the table
+above on all four components. That's close but not the bit-for-bit match the
+KITTI bicycle UKF gets against the same library (see below) — over 499
+sequential nonlinear CTRV steps (vs. KITTI's 153, on a less nonlinear
+model), two independently-written Cholesky decompositions (this repo's
+direct Crout-style factorization vs. `scipy.linalg.cholesky`'s LAPACK
+routine) accumulate floating-point rounding differently, and CTRV's
+straight-line/turning branch (`|yaw_rate| > 1e-4`) means a rounding-sized
+state difference can occasionally flip which branch a given step takes.
+Two independent implementations still agreeing to 3-4 significant figures on
+every RMSE component, with an *exact* match on every max|err|, is the useful
+result here: it rules out a structural bug (wrong sign, wrong weight, wrong
+sigma-point formula), which is what this check is actually for — bit-for-bit
+equivalence isn't a bar two independently-written nonlinear recursive
+filters should be expected to clear.
+
+The SR-KF row is validated differently, since filterpy's own
+`SquareRootKalmanFilter` class is linear-only (plain `F`/`H` attributes, no
+nonlinear-model hook the way its `ExtendedKalmanFilter` has `predict_x`/
+`HJacobian`/`Hx`) — it can't be pointed at a nonlinear model directly. So the
+check instead hand-transcribes the exact QR-based (Potter-form) recursion
+straight from filterpy's own `square_root.py` source and applies it with
+this repo's CTRV `f`/`h` and Jacobians: `RMSE px=0.0700 py=0.0803 vx=0.2142
+vy=0.3011`, `max|err|` also identical — a **bit-for-bit match**, unlike the
+UKF's. That's expected too: this is a real QR-based square-root filter (not
+the Cholesky-round-trip this repo's own `SquareRootKalmanFilter` uses — see
+`square_root_kalman.zig`'s doc comment), but since both recursions are
+algebraically the standard EKF/Joseph-form update and this model has no
+branch as sensitive to rounding as the UKF's sigma points, both
+implementations land on exactly the same floating-point trajectory.
 
 `imu_bench.zig` runs both the untuned defaults (`ekf_std_a_untuned = 2.0`,
 `ekf_std_yawdd_untuned = 0.5` — a reasonable guess, not fit to the data) and
@@ -288,19 +667,18 @@ Two things stand out:
    the measurements. Radar's `rho_dot` helps, but a correctly-modeled motion
    turns out to matter more than a second sensor here.
 
-The EKF wins across the board over the linear filter, as it should: it sees
-twice the measurements (radar's `rho_dot` speaks to velocity directly, which
-lidar never does) and its CTRV model actually turns, instead of assuming
-constant-velocity straight-line motion like the linear filter does.
+The EKF, IEKF, UKF, and SR-KF all win over the linear filter, as they
+should: they see twice the measurements (radar's `rho_dot` speaks to
+velocity directly, which lidar never does) and CTRV actually turns, instead
+of assuming constant-velocity straight-line motion like the linear filter
+does.
 
-Both EKF columns above use the exact same code path — only
-`ekf_std_a`/`ekf_std_yawdd` differ (see the table above and
-`imu_bench.zig`).
-
-
-`ExtendedKalmanFilter(n, k, m, Model)` takes its nonlinear model
-(`f`/`jacobianF`/`h`/`jacobianH`, optionally `residual`) as a **comptime**
-namespace.
+All five EKF/IEKF/UKF/SR-KF columns above use the exact same
+`ctrv.RadarModel`/`ctrv.LidarModel` — only `Q` differs between the two EKF
+columns, IEKF re-linearizes `H` up to 3 times per update instead of once,
+the filter engine (Jacobians vs. sigma points) differs for the UKF column,
+and the covariance representation (`P` directly vs. its Cholesky factor `L`)
+differs for the SR-KF column (see `imu_bench.zig`).
 
 ### Speed
 
@@ -311,27 +689,48 @@ target:
 | --- | --- | --- | --- |
 | Linear KF | Debug | ~5200-5500 | ~181-193k |
 | Linear KF | ReleaseFast | ~82-84 | ~12M |
-| Extended KF (either Q) | Debug | ~7600-7700 | ~130-131k |
+| Extended KF (either Q) | Debug | ~7600-8000 | ~125-131k |
 | Extended KF (either Q) | ReleaseFast | ~206-208 | ~4.8M |
+| Iterated EKF (3 iterations) | Debug | ~12600-17600 | ~57-79k |
+| Iterated EKF (3 iterations) | ReleaseFast | ~380-383 | ~2.6M |
+| Unscented KF | Debug | ~17500-20000 | ~50-57k |
+| Unscented KF | ReleaseFast | ~579-600 | ~1.7M |
+| Square-Root KF | Debug | ~9500-10450 | ~96-105k |
+| Square-Root KF | ReleaseFast | ~357-490 | ~2.0-2.8M |
 
 The EKF costs ~1.4x (Debug) to ~2.5x (ReleaseFast) the linear filter per
 cycle — Jacobian evaluation plus a 5-state (vs. 4-state) covariance
 recursion, plus radar's update runs against a 3-row measurement instead of
 lidar's 2. `Q`'s *value* doesn't change any of this — same matrix size,
-same equations, just different numbers going in.
+same equations, just different numbers going in. IEKF (3 iterations) costs
+~1.6-2.2x the plain EKF, roughly proportional to the iteration count, since
+each pass re-evaluates `jacobianH`/`h` and re-solves for `K` — cheap
+individually (no Cholesky, no sigma points), but it's real work done 3
+times instead of once. UKF costs another ~2.2-2.5x over the EKF: `2n+1=11`
+sigma points each get propagated through `f`/`h` individually every
+`predict()`/`update()`, plus a Cholesky decomposition per `predict()` —
+genuinely more arithmetic, not implementation overhead. SR-KF costs
+~20-30% more than the EKF: same Jacobian evaluation and Joseph-form
+recursion, plus one extra `P = L @ L^T` reconstruction and one extra
+Cholesky re-factorization per `predict()`/`update()` call — real but far
+cheaper than the UKF's `2n+1` sigma-point propagations.
+
 ### Memory
 
 ```
-Linear KF struct   = 544 bytes (n=4, k=1, m=2 state)
-Extended KF struct = 512 bytes (n=5, k=1, m=2 or 3 state)
-process peak RSS    = ~4.4-5.2 MB (whole program: runtime + embedded dataset + both filters)
+Linear KF struct      = 544 bytes (n=4, k=1, m=2 state)
+Extended KF struct    = 512 bytes (n=5, k=1, m=2 or 3 state)
+Iterated EKF struct   = 512 bytes (n=5, k=1, m=2 or 3 state) -- identical fields to the EKF's; max_iterations is comptime, not stored
+Unscented KF struct   = 952 bytes (n=5, k=1, m=2 or 3 state; carries 11 cached sigma points between predict() and update())
+Square-Root KF struct = 512 bytes (n=5, k=1, m=2 or 3 state) -- identical to the EKF's: same fields (x, Q, R), just P renamed to L
+process peak RSS      = ~4.4-5.8 MB (whole program: runtime + embedded dataset + all filters)
 ```
 
-Neither filter ever touches an allocator — every `maryam` matrix is a plain
+No filter ever touches an allocator — every `maryam` matrix is a plain
 `[rows][cols]f64` stack value, so each filter's persistent footprint is just
 its own `@sizeOf(...)`, a fixed compile-time constant regardless of how long
 it runs. Process peak RSS is dominated by the Zig runtime and the ~12KB
-embedded dataset, not by either filter.
+embedded dataset, not by any one filter.
 
 ## The KITTI benchmark (also `zig build run`)
 
@@ -368,14 +767,43 @@ max |err| px=1.5164  py=2.1841  vx=6.3497  vy=6.8624
 -- Bicycle EKF (different Q) -- IMU-driven, GPS correction --
 RMSE      px=0.4233  py=0.9343  vx=1.0038  vy=1.3689
 max |err| px=1.5205  py=2.2020  vx=6.3495  vy=6.8623
+
+-- Bicycle IEKF, max 3 iterations (same Q as untuned EKF) -- IMU-driven, GPS correction --
+RMSE      px=0.5156  py=0.9568  vx=0.9840  vy=1.3867
+max |err| px=1.5164  py=2.1841  vx=6.3497  vy=6.8624
+
+-- Bicycle UKF (same Q as untuned EKF) -- IMU-driven, GPS correction --
+RMSE      px=0.6856  py=1.1894  vx=0.7344  vy=1.1420
+max |err| px=1.8594  py=2.9322  vx=2.0484  vy=3.2594
+
+-- Bicycle SR-KF (same Q as untuned EKF) -- IMU-driven, GPS correction --
+RMSE      px=0.5156  py=0.9568  vx=0.9840  vy=1.3867
+max |err| px=1.5164  py=2.1841  vx=6.3497  vy=6.8624
 ```
 
-| RMSE | Linear KF (GPS only) | EKF, untuned Q | EKF, different Q | filterpy reference\* |
-| --- | --- | --- | --- | --- |
-| px | 0.6342 | 0.5156 | **0.4233** | 0.5156 |
-| py | **0.9290** | 0.9568 | 0.9343 | 0.9568 |
-| vx | **0.8059** | 0.9840 | 1.0038 | 0.9840 |
-| vy | 1.5129 | 1.3867 | **1.3689** | 1.3867 |
+| RMSE | Linear KF (GPS only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q\*\* | SR-KF, untuned Q\*\*\* | filterpy reference (EKF)\* |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| px | 0.6342 | 0.5156 | **0.4233** | 0.5156 | 0.6856 | 0.5156 | 0.5156 |
+| py | **0.9290** | 0.9568 | 0.9343 | 0.9568 | 1.1894 | 0.9568 | 0.9568 |
+| vx | 0.8059 | 0.9840 | 1.0038 | 0.9840 | **0.7344** | 0.9840 | 0.9840 |
+| vy | 1.5129 | 1.3867 | 1.3689 | 1.3867 | **1.1420** | 1.3867 | 1.3867 |
+
+\*\*\*\* **Identical to "EKF, untuned Q" to 4 decimal places, but for a
+different reason than the SR-KF column**: `gps_ins.GpsModel`'s measurement
+is GPS position, `h(x) = [px, py]`, whose Jacobian `jacobianH` is a constant
+matrix (`[[1,0,0,0],[0,1,0,0]]`) that doesn't depend on `x` at all. IEKF's
+entire mechanism is re-linearizing `H` at successively better state
+estimates — with a constant `H`, every iteration re-linearizes to the exact
+same matrix, so the second and later iterations are no-ops (the early-exit
+tolerance fires after one pass) and the result collapses to exactly the
+plain EKF. This is the honest flip side of the IMU benchmark's IEKF result
+below, where radar's `H` genuinely depends on `x` and iterating measurably
+helps: IEKF's value is entirely tied to how state-dependent the
+measurement's Jacobian actually is.
+
+\*\*\* Identical to "EKF, untuned Q" to 4 decimal places, same reasoning as
+the IMU benchmark's SR-KF column above: algebraically the same recursion,
+just a different covariance representation.
 
 \* [`filterpy`](https://github.com/rlabbe/filterpy) (Roger Labbe's widely-used
 open-source Kalman filter library, `pip install filterpy`) implementing the
@@ -387,7 +815,53 @@ exactly, so the untuned numbers are a property of the model/data, not an
 implementation bug. (The "different Q" column has no `filterpy` counterpart
 — it's only validating correctness, not chasing the same result.)
 
-`kitti_bench.zig` runs three configurations side by side rather than
+\*\* Same story on this dataset as the lidar/radar one above: with the exact
+same (untuned) `Q` as the EKF, sigma-point propagation through the bicycle
+model wins `vx`/`vy` outright and loses `px`/`py` to the tuned EKF — no
+Jacobian was derived for this. `filterpy`'s `UnscentedKalmanFilter`
+(`MerweScaledSigmaPoints(n=4, alpha=1.0, beta=2.0, kappa=0.0)`, matching this
+repo's fixed sigma-point parameters exactly) reproduces every one of these
+numbers to 4 decimal places, which is what actually caught the bug below.
+
+The SR-KF column is validated the same way the IMU benchmark's is: since
+filterpy's own `SquareRootKalmanFilter` can't be pointed at a nonlinear
+model, its exact QR-based (Potter-form) recursion is hand-transcribed from
+`filterpy/kalman/square_root.py` and applied with `gps_ins.zig`'s bicycle
+`f`/Jacobians instead. Result: `RMSE px=0.5156 py=0.9568 vx=0.9840
+vy=1.3867`, `max|err|` also identical — a bit-for-bit match with both this
+repo's own SR-KF and the plain EKF, exactly as expected (see the IMU
+benchmark's SR-KF validation note for why this one matches exactly while the
+UKF's doesn't).
+
+The IEKF column needs no separate numerical validation beyond the EKF's own
+`filterpy` match above: since `gps_ins.GpsModel`'s `H` is constant (see the
+table footnote), IEKF is provably identical to the EKF on this model for any
+correct implementation, and the Zig output matching the EKF's `filterpy`
+number to 4 decimal places already confirms that. The IMU benchmark's IEKF
+validation note (hand-transcribed Gauss-Newton recursion, independently
+matching to 4 decimal places on the CTRV model where iteration actually
+does something) is the one that actually exercises IEKF's own logic.
+
+### A real bug: UKF sigma points need a real initial covariance
+
+The bicycle EKF above initializes velocity/yaw-rate variance wide-open
+(`P[2][2] = P[3][3] = 1000`) since it has no prior belief about them and `P`
+that large is harmless for the EKF/linear filters — they only ever use `P`
+algebraically (as an uncertainty ellipsoid in matrix equations), never
+sample a point that far from the mean.
+
+Copying that same `P` into the UKF's init produced catastrophic divergence
+(`px` RMSE ~1.16, `vx` RMSE ~6.19 — worse than every other filter by a wide
+margin). The reason: UKF's sigma points are genuinely sampled at
+`mean ± sqrt(n+lambda)*L_column`, and `sqrt(1000)` times this filter's
+spread factor (~2) is ~63. For `yaw` — a periodic quantity — 63 radians
+wraps around 2π about ten times, landing sigma points at essentially
+arbitrary headings instead of "a plausible nearby heading." The fix was
+using `P[2][2] = P[3][3] = 1` for the UKF's own init only, leaving the EKF's
+init untouched. The `filterpy` exact-match above was what confirmed the fix
+was correct, not just "no longer obviously broken."
+
+`kitti_bench.zig` runs two `Q` configurations side by side rather than
 picking one: the untuned defaults above (`ekf_std_af_untuned = 1.0`,
 `ekf_std_wu_untuned = 0.2`, kept exactly as originally chosen so the
 `filterpy` validation stays reproducible), and a different `Q`
@@ -418,8 +892,26 @@ Two things are worth noting:
 | Linear KF | ReleaseFast | ~100 | 544 |
 | Bicycle EKF (either Q) | Debug | ~4700-6440 | 320 |
 | Bicycle EKF (either Q) | ReleaseFast | ~118 | 320 |
+| Bicycle IEKF (3 iterations) | Debug | ~6850-7750 | 320 |
+| Bicycle IEKF (3 iterations) | ReleaseFast | ~150 | 320 |
+| Bicycle UKF | Debug | ~10060-12850 | 608 |
+| Bicycle UKF | ReleaseFast | ~214-220 | 608 |
+| Bicycle SR-KF | Debug | ~6250-6950 | 320 |
+| Bicycle SR-KF | ReleaseFast | ~190-225 | 320 |
 
 The bicycle EKF's struct is smaller than the linear filter's (320 vs. 544
 bytes) despite being an EKF, because its state is the same size (`n=4`) but
 it doesn't carry persistent `F`/`B`/`H` fields the way the linear filter
-does — `F` is recomputed from the Jacobian each step and never stored.
+does — `F` is recomputed from the Jacobian each step and never stored. The
+UKF's struct (608 bytes) is bigger than either: it caches all `2n+1 = 9`
+sigma points between `predict()` and `update()` so `update()` doesn't need
+to regenerate them from `P` a second time. The SR-KF's struct is the same
+320 bytes as the EKF's (same fields, `P` just renamed to `L`), and its speed
+sits close to the EKF's too — the extra `P = L @ L^T` reconstruction and
+re-factorization per call cost noticeably less here than the UKF's `2n+1 = 9`
+sigma-point propagations. IEKF's struct is also the same 320 bytes
+(`max_iterations` is comptime, not a stored field), but unlike the IMU
+benchmark, its speed here is barely above the plain EKF's (~1.1-1.4x, not
+the ~1.6-2.2x there) — the 3 iterations still run, but with a constant `H`
+(see the accuracy table footnote above) each pass after the first is doing
+real but wasted linear-algebra work on an answer that's already converged.

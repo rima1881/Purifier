@@ -24,35 +24,23 @@ const kalman_core = @import("kalman_core.zig");
 ///     (measuring -179 degrees against a predicted +179 degrees is off by 2
 ///     degrees, not 358), which the filter then "corrects" for, diverging.
 pub fn ExtendedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize, comptime Model: type) type {
-    const StateVec = maryam.MatrixType(n, 1);
-    const StateMat = maryam.MatrixType(n, n);
-    const ControlVec = maryam.MatrixType(k, 1);
-    const MeasureVec = maryam.MatrixType(m, 1);
-    const MeasureNoise = maryam.MatrixType(m, m);
-
     const Core = kalman_core.KalmanCore(n, m);
+    const ControlVec = maryam.MatrixType(k, 1);
 
-    const residual = if (@hasDecl(Model, "residual"))
-        Model.residual
-    else
-        struct {
-            fn defaultResidual(z: MeasureVec, h_x: MeasureVec) MeasureVec {
-                return maryam.operation.subMatrix(MeasureVec, z, h_x);
-            }
-        }.defaultResidual;
+    const residual = kalman_core.defaultResidual(Model, Core.MeasureVec);
 
     return struct {
         const Self = @This();
 
         // Persistent State
-        x: StateVec,      // (n x 1) State estimate
-        P: StateMat,      // (n x n) Covariance matrix
+        x: Core.StateVec, // (n x 1) State estimate
+        P: Core.StateMat, // (n x n) Covariance matrix
 
         // Noise models. Unlike the linear filter, F/H aren't stored here --
         // they're Model's Jacobians, re-evaluated at the current state on
         // every call, so there's nothing persistent to keep for them.
-        Q: StateMat,      // (n x n) Process noise
-        R: MeasureNoise,  // (m x m) Measurement noise
+        Q: Core.StateMat, // (n x n) Process noise
+        R: Core.MeasureNoise, // (m x m) Measurement noise
 
         pub fn predict(self: *Self, u: ControlVec) void {
             const F = Model.jacobianF(self.x, u);
@@ -60,7 +48,7 @@ pub fn ExtendedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: us
             self.P = Core.PredictP.eval(.{ .F = F, .P = self.P, .Q = self.Q });
         }
 
-        pub fn update(self: *Self, z: MeasureVec) maryam.EvalError!void {
+        pub fn update(self: *Self, z: Core.MeasureVec) maryam.EvalError!void {
             const H = Model.jacobianH(self.x);
             const S = Core.InnovationS.eval(.{ .H = H, .P = self.P, .R = self.R });
             const K = try Core.KalmanGainK.eval(.{ .S = S, .H = H, .P = self.P });

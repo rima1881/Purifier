@@ -5,6 +5,13 @@ const Io = std.Io;
 // kitti_bench directly) is what makes `zig build test` discover ctrv.zig's/
 // gps_ins.zig's/bench_common.zig's/readme_examples.zig's own tests -- same
 // mechanism as src/root.zig's `test { refAllDecls(@This()); }` below.
+//
+// readme_examples.zig specifically also needs a second importer (see
+// bench_common.zig) -- a file whose *only* importer is this refAllDecls
+// root doesn't get its tests discovered by `zig build test` in this Zig
+// version (reproduced empirically: verified with multiple freshly-created
+// probe files, ruled out caching/ordering/content/creation-method as the
+// cause). Once a second, non-root file also imports it, its tests show up.
 const ctrv = @import("ctrv.zig");
 const gps_ins = @import("gps_ins.zig");
 const bench_common = @import("bench_common.zig");

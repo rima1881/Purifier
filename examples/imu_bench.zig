@@ -1,4 +1,4 @@
-//! Runs two filters against the same real lidar/radar dataset (synthetic but
+//! Runs the filters against the same real lidar/radar dataset (synthetic but
 //! sensor-realistic) and reports RMSE against ground truth, plus speed, for
 //! each -- so they can be compared directly. Dataset source:
 //! https://github.com/udacity/CarND-Extended-Kalman-Filter-Project
@@ -8,9 +8,12 @@
 //! rho/theta/rho_dot) rows require a nonlinear observation model and are
 //! skipped entirely.
 //!
-//! `extended_kalman.ExtendedKalmanFilter` uses a CTRV (constant turn rate and
-//! velocity) model (see `ctrv.zig`) with a genuinely nonlinear radar
-//! measurement model, so it consumes *all* 500 rows.
+//! `extended_kalman.ExtendedKalmanFilter`,
+//! `iterated_extended_kalman.IteratedExtendedKalmanFilter`,
+//! `unscented_kalman.UnscentedKalmanFilter`, and
+//! `square_root_kalman.SquareRootKalmanFilter` all use a CTRV (constant turn
+//! rate and velocity) model (see `ctrv.zig`) with a genuinely nonlinear
+//! radar measurement model, so all four consume *all* 500 rows.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,10 +21,15 @@ const Io = std.Io;
 const Purifier = @import("Purifier");
 const kalman = Purifier.kalman;
 const extended_kalman = Purifier.extended_kalman;
+const iterated_extended_kalman = Purifier.iterated_extended_kalman;
+const unscented_kalman = Purifier.unscented_kalman;
+const square_root_kalman = Purifier.square_root_kalman;
 const ctrv = @import("ctrv.zig");
+const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
 const bench_common = @import("bench_common.zig");
 const BenchResult = bench_common.BenchResult;
+const ErrorAccumulator = bench_common.ErrorAccumulator;
 const report = bench_common.report;
 
 const data = @embedFile("data/laser_radar_synthetic.txt");
@@ -29,58 +37,12 @@ const data = @embedFile("data/laser_radar_synthetic.txt");
 // ---- Linear KF: constant-velocity model, lidar only ----
 
 const KF = kalman.KalmanFilter(4, 1, 2);
-const StateVec = maryam.MatrixType(4, 1);
-const StateMat = maryam.MatrixType(4, 4);
-const ControlVec = maryam.MatrixType(1, 1);
-const ControlMat = maryam.MatrixType(4, 1);
-const MeasureVec = maryam.MatrixType(2, 1);
-const MeasureMat = maryam.MatrixType(2, 4);
-const MeasureNoise = maryam.MatrixType(2, 2);
-
-fn identityStateMat() StateMat {
-    var m = StateMat.zero();
-    m.data[0][0] = 1;
-    m.data[1][1] = 1;
-    m.data[2][2] = 1;
-    m.data[3][3] = 1;
-    return m;
-}
-
-// Constant-velocity state transition: px += vx*dt, py += vy*dt.
-fn stateTransition(dt: f64) StateMat {
-    var m = identityStateMat();
-    m.data[0][2] = dt;
-    m.data[1][3] = dt;
-    return m;
-}
-
-// Standard discretized-white-noise-acceleration process noise.
-fn linearProcessNoise(dt: f64, ax: f64, ay: f64) StateMat {
-    const dt2 = dt * dt;
-    const dt3 = dt2 * dt;
-    const dt4 = dt3 * dt;
-    var m = StateMat.zero();
-    m.data[0][0] = dt4 / 4 * ax;
-    m.data[0][2] = dt3 / 2 * ax;
-    m.data[2][0] = dt3 / 2 * ax;
-    m.data[2][2] = dt2 * ax;
-    m.data[1][1] = dt4 / 4 * ay;
-    m.data[1][3] = dt3 / 2 * ay;
-    m.data[3][1] = dt3 / 2 * ay;
-    m.data[3][3] = dt2 * ay;
-    return m;
-}
 
 fn runLinear(io: Io) !BenchResult {
     var filter: KF = undefined;
     var initialized = false;
     var prev_t: i64 = 0;
-
-    var sum_sq = [4]f64{ 0, 0, 0, 0 };
-    var max_abs = [4]f64{ 0, 0, 0, 0 };
-    var n_scored: usize = 0;
-    var n_singular: usize = 0;
-    var filter_ns: i96 = 0;
+    var acc = ErrorAccumulator{};
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
@@ -102,29 +64,24 @@ fn runLinear(io: Io) !BenchResult {
         if (!initialized) {
             filter = .{
                 .x = blk: {
-                    var m = StateVec.zero();
+                    var m = cv.StateVec.zero();
                     m.data = .{ .{px}, .{py}, .{0}, .{0} };
                     break :blk m;
                 },
                 .P = blk: {
-                    var m = StateMat.zero();
+                    var m = cv.StateMat.zero();
                     m.data[0][0] = 1;
                     m.data[1][1] = 1;
                     m.data[2][2] = 1000;
                     m.data[3][3] = 1000;
                     break :blk m;
                 },
-                .F = identityStateMat(),
-                .B = ControlMat.zero(),
-                .Q = StateMat.zero(),
-                .H = blk: {
-                    var m = MeasureMat.zero();
-                    m.data[0][0] = 1;
-                    m.data[1][1] = 1;
-                    break :blk m;
-                },
+                .F = cv.identity(),
+                .B = cv.ControlMat.zero(),
+                .Q = cv.StateMat.zero(),
+                .H = cv.measureH(),
                 .R = blk: {
-                    var m = MeasureNoise.zero();
+                    var m = cv.MeasureNoise.zero();
                     m.data[0][0] = 0.0225;
                     m.data[1][1] = 0.0225;
                     break :blk m;
@@ -138,50 +95,57 @@ fn runLinear(io: Io) !BenchResult {
         const dt: f64 = @as(f64, @floatFromInt(t - prev_t)) / 1_000_000.0;
         prev_t = t;
 
-        filter.F = stateTransition(dt);
-        filter.Q = linearProcessNoise(dt, 9.0, 9.0);
+        filter.F = cv.stateTransition(dt);
+        filter.Q = cv.processNoise(dt, 9.0, 9.0);
 
         const t0 = Io.Timestamp.now(io, .awake);
-        filter.predict(ControlVec.zero());
+        filter.predict(cv.ControlVec.zero());
 
-        var z = MeasureVec.zero();
+        var z = cv.MeasureVec.zero();
         z.data = .{ .{px}, .{py} };
         const update_result = filter.update(z);
         const t1 = Io.Timestamp.now(io, .awake);
-        filter_ns += t0.durationTo(t1).nanoseconds;
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
         update_result catch {
-            n_singular += 1;
+            acc.recordSingular();
             continue;
         };
 
-        const errs = [4]f64{
+        acc.record(.{
             filter.x.data[0][0] - gt_px,
             filter.x.data[1][0] - gt_py,
             filter.x.data[2][0] - gt_vx,
             filter.x.data[3][0] - gt_vy,
-        };
-        for (0..4) |i| {
-            sum_sq[i] += errs[i] * errs[i];
-            max_abs[i] = @max(max_abs[i], @abs(errs[i]));
-        }
-        n_scored += 1;
+        });
     }
 
-    const n: f64 = @floatFromInt(n_scored);
-    return .{
-        .n_scored = n_scored,
-        .n_singular = n_singular,
-        .rmse = .{ @sqrt(sum_sq[0] / n), @sqrt(sum_sq[1] / n), @sqrt(sum_sq[2] / n), @sqrt(sum_sq[3] / n) },
-        .max_abs = max_abs,
-        .avg_ns_per_cycle = @as(f64, @floatFromInt(filter_ns)) / n,
-        .struct_bytes = @sizeOf(KF),
-    };
+    return acc.finish(@sizeOf(KF));
 }
 
-// ---- EKF: CTRV model, lidar + radar ----
+// ---- EKF/UKF/SR-KF: CTRV model, lidar + radar ----
 
 const LidarEKF = extended_kalman.ExtendedKalmanFilter(5, 1, 2, ctrv.LidarModel);
 const RadarEKF = extended_kalman.ExtendedKalmanFilter(5, 1, 3, ctrv.RadarModel);
+
+// Reuses ctrv.LidarModel/ctrv.RadarModel unchanged for the UKF and SR-KF:
+// both only ever call .f/.h/.jacobianF/.jacobianH as needed and never
+// require anything ctrv.zig doesn't already provide for the EKF's sake.
+const LidarUKF = unscented_kalman.UnscentedKalmanFilter(5, 1, 2, ctrv.LidarModel);
+const RadarUKF = unscented_kalman.UnscentedKalmanFilter(5, 1, 3, ctrv.RadarModel);
+
+const LidarSRKF = square_root_kalman.SquareRootKalmanFilter(5, 1, 2, ctrv.LidarModel);
+const RadarSRKF = square_root_kalman.SquareRootKalmanFilter(5, 1, 3, ctrv.RadarModel);
+
+// max_iterations = 3, chosen empirically: swept 1/2/3/4/5/8/10 on this
+// dataset and the result is *not* monotonic (a known property of
+// undamped/vanilla Gauss-Newton IEKF -- with no step damping or line
+// search, a linearization can overshoot and the next iteration overcorrects
+// rather than settling). 3 iterations is the best performer of the sweep
+// (beats the plain EKF on vx/vy), 4/5/8 are all worse than even a single
+// pass -- see Readme.md's IMU benchmark section for the full sweep and the
+// discussion of why more iterations isn't reliably better here.
+const LidarIEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(5, 1, 2, ctrv.LidarModel, 3);
+const RadarIEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(5, 1, 3, ctrv.RadarModel, 3);
 
 // Untuned defaults, not fit to this dataset: std_a is longitudinal
 // acceleration noise (m/s^2), std_yawdd is yaw-acceleration noise (rad/s^2).
@@ -213,17 +177,22 @@ const ekf_R_radar: ctrv.RadarNoise = blk: {
     break :blk m;
 };
 
-fn runEkf(io: Io, std_a: f64, std_yawdd: f64) !BenchResult {
+// Shared by the EKF, IEKF, UKF, and SR-KF configurations below: only the
+// filter types (`Lidar`/`Radar`) differ between them, everything else --
+// dataset parsing, initialization, dt/Q computation, error accumulation --
+// is identical. `bench_common.predictErr` absorbs one real behavioral
+// difference (EKF's and IEKF's predict() can't fail; UKF's and SR-KF's can,
+// since both run a Cholesky decomposition), and
+// `bench_common.makeFilter`/`covOf` absorb another (SR-KF's
+// covariance-representation field is named `L`, not `P`, since it stores a
+// Cholesky factor rather than P itself). IEKF needs no changes here at all
+// -- its `predict()`/`update()` signatures are identical to the plain EKF's.
+fn runFilterPair(comptime Lidar: type, comptime Radar: type, io: Io, std_a: f64, std_yawdd: f64) !BenchResult {
     var x = ctrv.StateVec.zero();
-    var P = maryam.I(5);
+    var cov = maryam.I(5);
     var initialized = false;
     var prev_t: i64 = 0;
-
-    var sum_sq = [4]f64{ 0, 0, 0, 0 };
-    var max_abs = [4]f64{ 0, 0, 0, 0 };
-    var n_scored: usize = 0;
-    var n_singular: usize = 0;
-    var filter_ns: i96 = 0;
+    var acc = ErrorAccumulator{};
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
@@ -247,7 +216,9 @@ fn runEkf(io: Io, std_a: f64, std_yawdd: f64) !BenchResult {
         if (!initialized) {
             // v, yaw, yaw_rate can't be observed from a single measurement of
             // either sensor, so they start at 0 with wide-open uncertainty
-            // (P = I) and the filter has to converge onto them from motion.
+            // (P = I, i.e. cov = I -- I is trivially its own Cholesky factor,
+            // so this same value is correct whether `cov` ends up meaning P
+            // or L) and the filter has to converge onto them from motion.
             if (is_radar) {
                 x.data[0][0] = meas1 * @cos(meas2); // rho * cos(theta)
                 x.data[1][0] = meas1 * @sin(meas2); // rho * sin(theta)
@@ -269,87 +240,78 @@ fn runEkf(io: Io, std_a: f64, std_yawdd: f64) !BenchResult {
         const t0 = Io.Timestamp.now(io, .awake);
         var update_err: ?maryam.EvalError = null;
         if (is_radar) {
-            var filt = RadarEKF{
-                .x = x,
-                .P = P,
-                .Q = Q,
-                .R = ekf_R_radar,
-            };
-            filt.predict(dt_vec);
-            var z = ctrv.RadarVec.zero();
-            z.data = .{ .{meas1}, .{meas2}, .{meas3} };
-            filt.update(z) catch |e| {
-                update_err = e;
-            };
+            var filt = bench_common.makeFilter(Radar, x, cov, Q, ekf_R_radar);
+            update_err = bench_common.predictErr(&filt, dt_vec);
+            if (update_err == null) {
+                var z = ctrv.RadarVec.zero();
+                z.data = .{ .{meas1}, .{meas2}, .{meas3} };
+                filt.update(z) catch |e| {
+                    update_err = e;
+                };
+            }
             x = filt.x;
-            P = filt.P;
+            cov = bench_common.covOf(ctrv.StateMat, filt);
         } else {
-            var filt = LidarEKF{
-                .x = x,
-                .P = P,
-                .Q = Q,
-                .R = ekf_R_lidar,
-            };
-            filt.predict(dt_vec);
-            var z = ctrv.LidarVec.zero();
-            z.data = .{ .{meas1}, .{meas2} };
-            filt.update(z) catch |e| {
-                update_err = e;
-            };
+            var filt = bench_common.makeFilter(Lidar, x, cov, Q, ekf_R_lidar);
+            update_err = bench_common.predictErr(&filt, dt_vec);
+            if (update_err == null) {
+                var z = ctrv.LidarVec.zero();
+                z.data = .{ .{meas1}, .{meas2} };
+                filt.update(z) catch |e| {
+                    update_err = e;
+                };
+            }
             x = filt.x;
-            P = filt.P;
+            cov = bench_common.covOf(ctrv.StateMat, filt);
         }
         const t1 = Io.Timestamp.now(io, .awake);
-        filter_ns += t0.durationTo(t1).nanoseconds;
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
 
         if (update_err != null) {
-            n_singular += 1;
+            acc.recordSingular();
             continue;
         }
 
         const est_vx = x.data[2][0] * @cos(x.data[3][0]);
         const est_vy = x.data[2][0] * @sin(x.data[3][0]);
-        const errs = [4]f64{
+        acc.record(.{
             x.data[0][0] - gt_px,
             x.data[1][0] - gt_py,
             est_vx - gt_vx,
             est_vy - gt_vy,
-        };
-        for (0..4) |i| {
-            sum_sq[i] += errs[i] * errs[i];
-            max_abs[i] = @max(max_abs[i], @abs(errs[i]));
-        }
-        n_scored += 1;
+        });
     }
 
-    const n: f64 = @floatFromInt(n_scored);
-    return .{
-        .n_scored = n_scored,
-        .n_singular = n_singular,
-        .rmse = .{ @sqrt(sum_sq[0] / n), @sqrt(sum_sq[1] / n), @sqrt(sum_sq[2] / n), @sqrt(sum_sq[3] / n) },
-        .max_abs = max_abs,
-        .avg_ns_per_cycle = @as(f64, @floatFromInt(filter_ns)) / n,
-        .struct_bytes = @max(@sizeOf(LidarEKF), @sizeOf(RadarEKF)),
-    };
+    return acc.finish(@max(@sizeOf(Lidar), @sizeOf(Radar)));
 }
 
 pub fn run(w: *Io.Writer, io: Io) !void {
     const linear = try runLinear(io);
-    const ekf_untuned = try runEkf(io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
-    const ekf_alt = try runEkf(io, ekf_std_a_alt, ekf_std_yawdd_alt);
+    const ekf_untuned = try runFilterPair(LidarEKF, RadarEKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
+    const ekf_alt = try runFilterPair(LidarEKF, RadarEKF, io, ekf_std_a_alt, ekf_std_yawdd_alt);
+    // Same untuned Q as "EKF, untuned Q" for both -- IEKF and SR-KF are
+    // both built directly on top of the plain EKF (re-linearize more, or
+    // represent P differently), so holding Q fixed isolates exactly what
+    // each one changes.
+    const iekf = try runFilterPair(LidarIEKF, RadarIEKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
+    const ukf = try runFilterPair(LidarUKF, RadarUKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
+    const srkf = try runFilterPair(LidarSRKF, RadarSRKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
 
     try w.print("dataset: 250 lidar rows, 250 radar rows (all filters see the same data)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, lidar only", linear);
     try report(w, "Extended KF (untuned Q) -- CTRV model, lidar + radar", ekf_untuned);
     try report(w, "Extended KF (different Q) -- CTRV model, lidar + radar", ekf_alt);
+    try report(w, "Iterated EKF, max 3 iterations (same Q as untuned EKF) -- CTRV model, lidar + radar", iekf);
+    try report(w, "Unscented KF (same Q as untuned EKF) -- CTRV model, lidar + radar", ukf);
+    try report(w, "Square-Root KF (same Q as untuned EKF) -- CTRV model, lidar + radar", srkf);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3] });
-    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
-        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle,
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0], iekf.rmse[0], ukf.rmse[0], srkf.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1], iekf.rmse[1], ukf.rmse[1], srkf.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2], iekf.rmse[2], ukf.rmse[2], srkf.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3], iekf.rmse[3], ukf.rmse[3], srkf.rmse[3] });
+    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
+        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle, iekf.avg_ns_per_cycle, ukf.avg_ns_per_cycle, srkf.avg_ns_per_cycle,
     });
 
     if (builtin.os.tag != .windows) {

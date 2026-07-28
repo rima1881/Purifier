@@ -1,4 +1,4 @@
-//! Runs two filters against a real KITTI raw sequence (2011_09_26_drive_0005,
+//! Runs the filters against a real KITTI raw sequence (2011_09_26_drive_0005,
 //! oxts channel only: https://www.cvlibs.net/datasets/kitti/raw_data.php) and
 //! reports RMSE against ground truth, plus speed -- same shape of comparison
 //! as `imu_bench.zig`, different dataset and problem structure.
@@ -26,69 +26,30 @@ const Io = std.Io;
 const Purifier = @import("Purifier");
 const kalman = Purifier.kalman;
 const extended_kalman = Purifier.extended_kalman;
+const iterated_extended_kalman = Purifier.iterated_extended_kalman;
+const unscented_kalman = Purifier.unscented_kalman;
+const square_root_kalman = Purifier.square_root_kalman;
 const gps_ins = @import("gps_ins.zig");
+const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
 const bench_common = @import("bench_common.zig");
 const BenchResult = bench_common.BenchResult;
+const ErrorAccumulator = bench_common.ErrorAccumulator;
 const report = bench_common.report;
 
 const data = @embedFile("data/kitti_gps_imu.txt");
 
+const gps_noise_var = 4.0; // (2m std)^2, matches the dataset generator
+
 // ---- Linear KF: constant-velocity model, GPS only, no IMU ----
 
 const KF = kalman.KalmanFilter(4, 1, 2);
-const LinStateVec = maryam.MatrixType(4, 1);
-const LinStateMat = maryam.MatrixType(4, 4);
-const LinControlVec = maryam.MatrixType(1, 1);
-const LinControlMat = maryam.MatrixType(4, 1);
-const LinMeasureVec = maryam.MatrixType(2, 1);
-const LinMeasureMat = maryam.MatrixType(2, 4);
-const LinMeasureNoise = maryam.MatrixType(2, 2);
-
-fn linIdentity() LinStateMat {
-    var m = LinStateMat.zero();
-    m.data[0][0] = 1;
-    m.data[1][1] = 1;
-    m.data[2][2] = 1;
-    m.data[3][3] = 1;
-    return m;
-}
-
-fn linStateTransition(dt: f64) LinStateMat {
-    var m = linIdentity();
-    m.data[0][2] = dt;
-    m.data[1][3] = dt;
-    return m;
-}
-
-fn linProcessNoise(dt: f64, ax: f64, ay: f64) LinStateMat {
-    const dt2 = dt * dt;
-    const dt3 = dt2 * dt;
-    const dt4 = dt3 * dt;
-    var m = LinStateMat.zero();
-    m.data[0][0] = dt4 / 4 * ax;
-    m.data[0][2] = dt3 / 2 * ax;
-    m.data[2][0] = dt3 / 2 * ax;
-    m.data[2][2] = dt2 * ax;
-    m.data[1][1] = dt4 / 4 * ay;
-    m.data[1][3] = dt3 / 2 * ay;
-    m.data[3][1] = dt3 / 2 * ay;
-    m.data[3][3] = dt2 * ay;
-    return m;
-}
-
-const gps_noise_var = 4.0; // (2m std)^2, matches the dataset generator
 
 fn runLinear(io: Io) !BenchResult {
     var filter: KF = undefined;
     var initialized = false;
     var prev_t: f64 = 0;
-
-    var sum_sq = [4]f64{ 0, 0, 0, 0 };
-    var max_abs = [4]f64{ 0, 0, 0, 0 };
-    var n_scored: usize = 0;
-    var n_singular: usize = 0;
-    var filter_ns: i96 = 0;
+    var acc = ErrorAccumulator{};
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
@@ -109,29 +70,24 @@ fn runLinear(io: Io) !BenchResult {
         if (!initialized) {
             filter = .{
                 .x = blk: {
-                    var m = LinStateVec.zero();
+                    var m = cv.StateVec.zero();
                     m.data = .{ .{gps_px}, .{gps_py}, .{0}, .{0} };
                     break :blk m;
                 },
                 .P = blk: {
-                    var m = LinStateMat.zero();
+                    var m = cv.StateMat.zero();
                     m.data[0][0] = 1;
                     m.data[1][1] = 1;
                     m.data[2][2] = 1000;
                     m.data[3][3] = 1000;
                     break :blk m;
                 },
-                .F = linIdentity(),
-                .B = LinControlMat.zero(),
-                .Q = LinStateMat.zero(),
-                .H = blk: {
-                    var m = LinMeasureMat.zero();
-                    m.data[0][0] = 1;
-                    m.data[1][1] = 1;
-                    break :blk m;
-                },
+                .F = cv.identity(),
+                .B = cv.ControlMat.zero(),
+                .Q = cv.StateMat.zero(),
+                .H = cv.measureH(),
                 .R = blk: {
-                    var m = LinMeasureNoise.zero();
+                    var m = cv.MeasureNoise.zero();
                     m.data[0][0] = gps_noise_var;
                     m.data[1][1] = gps_noise_var;
                     break :blk m;
@@ -145,51 +101,44 @@ fn runLinear(io: Io) !BenchResult {
         const dt = t - prev_t;
         prev_t = t;
 
-        filter.F = linStateTransition(dt);
-        filter.Q = linProcessNoise(dt, 9.0, 9.0);
+        filter.F = cv.stateTransition(dt);
+        filter.Q = cv.processNoise(dt, 9.0, 9.0);
 
         const t0 = Io.Timestamp.now(io, .awake);
-        filter.predict(LinControlVec.zero());
+        filter.predict(cv.ControlVec.zero());
 
-        var z = LinMeasureVec.zero();
+        var z = cv.MeasureVec.zero();
         z.data = .{ .{gps_px}, .{gps_py} };
         const update_result = filter.update(z);
         const t1 = Io.Timestamp.now(io, .awake);
-        filter_ns += t0.durationTo(t1).nanoseconds;
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
         update_result catch {
-            n_singular += 1;
+            acc.recordSingular();
             continue;
         };
 
         const gt_vx = gt_v * @cos(gt_yaw);
         const gt_vy = gt_v * @sin(gt_yaw);
-        const errs = [4]f64{
+        acc.record(.{
             filter.x.data[0][0] - gt_px,
             filter.x.data[1][0] - gt_py,
             filter.x.data[2][0] - gt_vx,
             filter.x.data[3][0] - gt_vy,
-        };
-        for (0..4) |i| {
-            sum_sq[i] += errs[i] * errs[i];
-            max_abs[i] = @max(max_abs[i], @abs(errs[i]));
-        }
-        n_scored += 1;
+        });
     }
 
-    const n: f64 = @floatFromInt(n_scored);
-    return .{
-        .n_scored = n_scored,
-        .n_singular = n_singular,
-        .rmse = .{ @sqrt(sum_sq[0] / n), @sqrt(sum_sq[1] / n), @sqrt(sum_sq[2] / n), @sqrt(sum_sq[3] / n) },
-        .max_abs = max_abs,
-        .avg_ns_per_cycle = @as(f64, @floatFromInt(filter_ns)) / n,
-        .struct_bytes = @sizeOf(KF),
-    };
+    return acc.finish(@sizeOf(KF));
 }
 
-// ---- Bicycle EKF: IMU-driven (real af/wu control inputs), GPS correction ----
+// ---- Bicycle EKF/UKF/SR-KF: IMU-driven (real af/wu control inputs), GPS correction ----
 
 const BicycleEKF = extended_kalman.ExtendedKalmanFilter(4, 3, 2, gps_ins.GpsModel);
+
+// Reuses gps_ins.GpsModel unchanged for the IEKF, UKF, and SR-KF -- same
+// reasoning as imu_bench.zig's LidarUKF/RadarUKF/LidarSRKF/RadarSRKF.
+const BicycleIEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(4, 3, 2, gps_ins.GpsModel, 3);
+const BicycleUKF = unscented_kalman.UnscentedKalmanFilter(4, 3, 2, gps_ins.GpsModel);
+const BicycleSRKF = square_root_kalman.SquareRootKalmanFilter(4, 3, 2, gps_ins.GpsModel);
 
 // Same values used to independently validate this model against filterpy
 // (see maryam_fix.md / Readme.md for how that comparison was produced) --
@@ -205,17 +154,39 @@ const ekf_std_wu_untuned = 0.2; // process-noise std for the yaw-rate input, rad
 const ekf_std_af_alt = 0.15;
 const ekf_std_wu_alt = 0.03;
 
-fn runBicycleEkf(io: Io, std_af: f64, std_wu: f64) !BenchResult {
+// Shared by the EKF, IEKF, UKF, and SR-KF configurations below: only the
+// filter type (`Filter`) and initial v/yaw covariance differ, everything
+// else -- dataset parsing, dt/Q computation, error accumulation -- is
+// identical. `bench_common.predictErr` absorbs one structural difference
+// (EKF's and IEKF's predict() can't fail; UKF's and SR-KF's can), and
+// `bench_common.makeFilter`/`covOf` absorb another (SR-KF's field is `L`,
+// not `P`). IEKF needs no changes here at all -- same `predict()`/`update()`
+// signatures as the plain EKF.
+//
+// `initial_vyaw_cov` exists because the "right" initial value is NOT the
+// same number for every filter, unlike everywhere else in this codebase
+// where P's exact magnitude doesn't matter as long as it's "wide":
+//   - EKF/linear/IEKF use P purely algebraically, so P[2][2]=P[3][3]=1000
+//     (no prior belief about v/yaw) is harmless -- IEKF re-linearizes H at
+//     better state estimates, but never samples a point far from the mean
+//     the way the UKF does, so it has no analogous sensitivity.
+//   - UKF's sigma points are genuinely sampled at mean +- sqrt(n+lambda)*
+//     sigma, and sqrt(1000)*spread(~2) is ~63 -- for `yaw`, a periodic
+//     quantity, 63 radians wraps around 2*pi about ten times, landing sigma
+//     points at essentially arbitrary phases. Found by comparing the UKF's
+//     first (broken, RMSE in the single digits) results against the EKF's;
+//     the fix is passing 1 instead of 1000 for the UKF, confirmed correct
+//     via the filterpy exact-match documented in Readme.md.
+//   - SR-KF is algebraically identical to the EKF (see
+//     square_root_kalman.zig), so it wants the *same* P=1000 the EKF gets
+//     -- but SR-KF's field holds P's Cholesky factor, not P, so the value
+//     passed for it is `@sqrt(1000)`, not `1000`.
+fn runBicyclePair(comptime Filter: type, io: Io, std_af: f64, std_wu: f64, initial_vyaw_cov: f64) !BenchResult {
     var x = gps_ins.StateVec.zero();
-    var P = maryam.I(4);
+    var cov = maryam.I(4);
     var initialized = false;
     var prev_t: f64 = 0;
-
-    var sum_sq = [4]f64{ 0, 0, 0, 0 };
-    var max_abs = [4]f64{ 0, 0, 0, 0 };
-    var n_scored: usize = 0;
-    var n_singular: usize = 0;
-    var filter_ns: i96 = 0;
+    var acc = ErrorAccumulator{};
 
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line_raw| {
@@ -236,12 +207,12 @@ fn runBicycleEkf(io: Io, std_af: f64, std_wu: f64) !BenchResult {
         if (!initialized) {
             x.data[0][0] = gps_px;
             x.data[1][0] = gps_py;
-            P = blk: {
+            cov = blk: {
                 var m = gps_ins.StateMat.zero();
                 m.data[0][0] = 1;
                 m.data[1][1] = 1;
-                m.data[2][2] = 1000;
-                m.data[3][3] = 1000;
+                m.data[2][2] = initial_vyaw_cov;
+                m.data[3][3] = initial_vyaw_cov;
                 break :blk m;
             };
             prev_t = t;
@@ -257,78 +228,71 @@ fn runBicycleEkf(io: Io, std_af: f64, std_wu: f64) !BenchResult {
         u.data = .{ .{af}, .{wu}, .{dt} };
 
         const t0 = Io.Timestamp.now(io, .awake);
-        var filt = BicycleEKF{
-            .x = x,
-            .P = P,
-            .Q = Q,
-            .R = blk: {
-                var m = gps_ins.GpsNoise.zero();
-                m.data[0][0] = gps_noise_var;
-                m.data[1][1] = gps_noise_var;
-                break :blk m;
-            },
-        };
-        filt.predict(u);
-        var z = gps_ins.GpsVec.zero();
-        z.data = .{ .{gps_px}, .{gps_py} };
-        const update_result = filt.update(z);
+        var filt = bench_common.makeFilter(Filter, x, cov, Q, blk: {
+            var m = gps_ins.GpsNoise.zero();
+            m.data[0][0] = gps_noise_var;
+            m.data[1][1] = gps_noise_var;
+            break :blk m;
+        });
+        var update_err = bench_common.predictErr(&filt, u);
+        if (update_err == null) {
+            var z = gps_ins.GpsVec.zero();
+            z.data = .{ .{gps_px}, .{gps_py} };
+            filt.update(z) catch |e| {
+                update_err = e;
+            };
+        }
         const t1 = Io.Timestamp.now(io, .awake);
-        filter_ns += t0.durationTo(t1).nanoseconds;
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
         x = filt.x;
-        P = filt.P;
-        update_result catch {
-            n_singular += 1;
+        cov = bench_common.covOf(gps_ins.StateMat, filt);
+
+        if (update_err != null) {
+            acc.recordSingular();
             continue;
-        };
+        }
 
         const est_vx = x.data[2][0] * @cos(x.data[3][0]);
         const est_vy = x.data[2][0] * @sin(x.data[3][0]);
         const gt_vx = gt_v * @cos(gt_yaw);
         const gt_vy = gt_v * @sin(gt_yaw);
-        const errs = [4]f64{
+        acc.record(.{
             x.data[0][0] - gt_px,
             x.data[1][0] - gt_py,
             est_vx - gt_vx,
             est_vy - gt_vy,
-        };
-        for (0..4) |i| {
-            sum_sq[i] += errs[i] * errs[i];
-            max_abs[i] = @max(max_abs[i], @abs(errs[i]));
-        }
-        n_scored += 1;
+        });
     }
 
-    const n: f64 = @floatFromInt(n_scored);
-    return .{
-        .n_scored = n_scored,
-        .n_singular = n_singular,
-        .rmse = .{ @sqrt(sum_sq[0] / n), @sqrt(sum_sq[1] / n), @sqrt(sum_sq[2] / n), @sqrt(sum_sq[3] / n) },
-        .max_abs = max_abs,
-        .avg_ns_per_cycle = @as(f64, @floatFromInt(filter_ns)) / n,
-        .struct_bytes = @sizeOf(BicycleEKF),
-    };
+    return acc.finish(@sizeOf(Filter));
 }
 
 pub fn run(w: *Io.Writer, io: Io) !void {
     const linear = try runLinear(io);
-    const bicycle_untuned = try runBicycleEkf(io, ekf_std_af_untuned, ekf_std_wu_untuned);
-    const bicycle_alt = try runBicycleEkf(io, ekf_std_af_alt, ekf_std_wu_alt);
+    const bicycle_untuned = try runBicyclePair(BicycleEKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
+    const bicycle_alt = try runBicyclePair(BicycleEKF, io, ekf_std_af_alt, ekf_std_wu_alt, 1000);
+    const bicycle_iekf = try runBicyclePair(BicycleIEKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
+    const bicycle_ukf = try runBicyclePair(BicycleUKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1);
+    const bicycle_srkf = try runBicyclePair(BicycleSRKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, @sqrt(1000.0));
 
     try w.print("dataset: KITTI 2011_09_26_drive_0005 (real vehicle trajectory, 154 frames @ ~9.6Hz)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, GPS only (no IMU)", linear);
     try report(w, "Bicycle EKF (untuned Q) -- IMU-driven, GPS correction", bicycle_untuned);
     try report(w, "Bicycle EKF (different Q) -- IMU-driven, GPS correction", bicycle_alt);
+    try report(w, "Bicycle IEKF, max 3 iterations (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_iekf);
+    try report(w, "Bicycle UKF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_ukf);
+    try report(w, "Bicycle SR-KF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_srkf);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3] });
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0], bicycle_iekf.rmse[0], bicycle_ukf.rmse[0], bicycle_srkf.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1], bicycle_iekf.rmse[1], bicycle_ukf.rmse[1], bicycle_srkf.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2], bicycle_iekf.rmse[2], bicycle_ukf.rmse[2], bicycle_srkf.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3], bicycle_iekf.rmse[3], bicycle_ukf.rmse[3], bicycle_srkf.rmse[3] });
 
     if (builtin.os.tag != .windows) {
         const ru = std.posix.getrusage(std.posix.rusage.SELF);
         const peak_kb: i64 = if (builtin.os.tag == .macos) @divTrunc(ru.maxrss, 1024) else ru.maxrss;
-        try w.print("\nprocess peak RSS = {d} KB (whole program, all four filters + both benchmarks)\n", .{peak_kb});
+        try w.print("\nprocess peak RSS = {d} KB (whole program, all six filters + both benchmarks)\n", .{peak_kb});
     }
 
     try w.flush();

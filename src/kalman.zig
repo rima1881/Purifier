@@ -3,44 +3,39 @@ const maryam = @import("maryam");
 const kalman_core = @import("kalman_core.zig");
 
 pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) type {
-    // 1. Matrix Type Definitions based on dimensions:
-    // n = state count, k = control count, m = measurement count
-    const StateVec     = maryam.MatrixType(n, 1);
-    const StateMat     = maryam.MatrixType(n, n);
-    const ControlVec   = maryam.MatrixType(k, 1);
-    const ControlMat   = maryam.MatrixType(n, k);
-    const MeasureVec   = maryam.MatrixType(m, 1);
-    const MeasureMat   = maryam.MatrixType(m, n);
-    const MeasureNoise = maryam.MatrixType(m, m);
-
     const Core = kalman_core.KalmanCore(n, m);
+    // Only the k-dependent control types are declared here -- everything
+    // else (StateVec/StateMat/MeasureVec/MeasureMat/MeasureNoise) comes
+    // straight from Core, since n and m are all it needs.
+    const ControlVec = maryam.MatrixType(k, 1);
+    const ControlMat = maryam.MatrixType(n, k);
 
     return struct {
         const Self = @This();
 
         // Persistent State
-        x: StateVec,      // (n x 1) State estimate
-        P: StateMat,      // (n x n) Covariance matrix
+        x: Core.StateVec, // (n x 1) State estimate
+        P: Core.StateMat, // (n x n) Covariance matrix
 
         // Model Parameters
-        F: StateMat,      // (n x n) State transition
-        B: ControlMat,    // (n x k) Control matrix
-        Q: StateMat,      // (n x n) Process noise
-        H: MeasureMat,    // (m x n) Measurement transition
-        R: MeasureNoise,  // (m x m) Measurement noise
+        F: Core.StateMat, // (n x n) State transition
+        B: ControlMat, // (n x k) Control matrix
+        Q: Core.StateMat, // (n x n) Process noise
+        H: Core.MeasureMat, // (m x n) Measurement transition
+        R: Core.MeasureNoise, // (m x m) Measurement noise
 
         // Symbolic Equations specific to the *linear* model (Core covers
         // everything shared with other filter variants).
         const PredictX = maryam.Equation("F @ x + B @ u", struct {
-            F: StateMat,
-            x: StateVec,
+            F: Core.StateMat,
+            x: Core.StateVec,
             B: ControlMat,
             u: ControlVec,
         });
         const Innovation = maryam.Equation("z - H @ x", struct {
-            z: MeasureVec,
-            H: MeasureMat,
-            x: StateVec,
+            z: Core.MeasureVec,
+            H: Core.MeasureMat,
+            x: Core.StateVec,
         });
 
         pub fn predict(self: *Self, u: ControlVec) void {
@@ -48,7 +43,7 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
             self.P = Core.PredictP.eval(.{ .F = self.F, .P = self.P, .Q = self.Q });
         }
 
-        pub fn update(self: *Self, z: MeasureVec) maryam.EvalError!void {
+        pub fn update(self: *Self, z: Core.MeasureVec) maryam.EvalError!void {
             const S = Core.InnovationS.eval(.{ .H = self.H, .P = self.P, .R = self.R });
             const K = try Core.KalmanGainK.eval(.{ .S = S, .H = self.H, .P = self.P });
             const y = Innovation.eval(.{ .z = z, .H = self.H, .x = self.x });
