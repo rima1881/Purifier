@@ -16,6 +16,13 @@ since upstream hasn't bumped it for this addition yet). Both `unscented_kalman.z
 and `square_root_kalman.zig` are now implemented on top of it — see item 9
 for the primitive SR-KF's own next step is blocked on.
 
+**Update (past that, still unreleased on `main`)**: `operation.qrMatrix`
+landed (item 9) — Householder QR, plus `^Q`/`^R` equation-DSL syntax and a
+new `EvalError.RankDeficient`. Purifier is pinned to this commit too. Not
+yet consumed anywhere in this repo — `square_root_kalman.zig` still uses the
+`P = L @ L^T` round-trip item 9 describes; switching it to a true QR-based
+recursion is the natural next step now that the primitive exists.
+
 ## 1. Hardcoded `f64` — blocks the original Arduino target (open)
 
 `MatrixType(rows, cols)` always stores `[rows][cols]f64`
@@ -94,25 +101,23 @@ need `sqrt((n+lambda)*P)`) and SR-KF (propagates a Cholesky factor of `P`
 directly) on the Filters checklist in `Readme.md` — both are now implemented
 (`unscented_kalman.zig`, `square_root_kalman.zig`).
 
-## 9. No QR decomposition — blocks a "true" square-root filter (open)
+## 9. RESOLVED — QR decomposition exposed
 
-`square_root_kalman.zig` (`SquareRootKalmanFilter`) propagates a Cholesky
-factor `L` of `P` as its persistent state, but internally still
-reconstructs `P = L @ L^T` every `predict()`/`update()` to run the ordinary
-Joseph-form recursion, then re-factors the result back into `L`. That gets a
-real benefit (every step's `P` is validated as genuinely SPD, or the filter
-reports `error.NotPositiveDefinite` immediately) but not the classical
-square-root technique's actual point: a "true" square-root filter (Potter/
-Carlson/Bierman form) never re-forms `P` at all, instead propagating `L`
-directly through a **QR decomposition** — e.g. predict's `L' = qr([F @ L |
-Q^0.5]^T)`'s upper-triangular factor, transposed — which keeps the working
-condition number at `cond(L)` instead of `cond(P) = cond(L)^2`. Verified by
-hand-implementing this exact recursion in Python (transcribed from
-filterpy's `square_root.py`, which does use `scipy.linalg.qr`) for both
-benchmark models — see `Readme.md`'s SR-KF validation notes.
+`operation.qrMatrix(T, a) -> ?struct { q: MatrixType(m, m), r: T }` (Householder
+reflections, `a = q @ r`, `null` if `a` doesn't have full column rank) is
+public now, along with `^Q`/`^R` equation-DSL syntax and a new
+`EvalError.RankDeficient`. `square_root_kalman.zig`'s `update()` now uses it
+directly (Potter/Carlson-form square-root update, never re-forming `P`) —
+see its module doc comment for the full recursion and validation notes.
 
-**Suggested change**: expose a QR (or just Householder-reflection)
-decomposition primitive, e.g. `operation.qrMatrix(T, a) -> struct { q: T, r:
-T }`. Would let `SquareRootKalmanFilter` (and a future square-root UKF,
-sidestepping *its* Joseph-form-adjacent weak spot noted in
-`unscented_kalman.zig`) drop the `P = L @ L^T` round-trip entirely.
+One thing this update did **not** unblock: `predict()` still round-trips
+through `P = L @ L^T`, because every process-noise `Q` this repo actually
+builds (`ctrv.processNoise`, `gps_ins.processNoise`) is constructed from a
+low-dimensional white-noise source (`G @ Qv @ G^T`) and is therefore always
+rank-deficient — neither `choleskyMatrix` nor `sqrtMatrix` can factor a
+singular `Q` to get the `Q^0.5` a QR-based predict step would need. That's a
+property of these specific models, not a further maryam gap; a `Model` that
+exposed its process noise as a low-rank factor directly (rather than a full
+`n x n` `Q`) could sidestep it, but that would be a Purifier-side API change
+(the filters all take `Q: StateMat` as a runtime field today), not a maryam
+one.

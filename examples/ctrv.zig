@@ -160,6 +160,47 @@ fn normalizeAngle(a: f64) f64 {
     return r - std.math.pi;
 }
 
+/// `error_state_kalman.ErrorStateKalmanFilter`'s "boxplus" hook: folds the
+/// Kalman correction onto the state like plain addition would, with two
+/// adjustments plain addition can't express:
+///   - `yaw` (index 3) is wrapped into `(-pi, pi]` -- same reasoning as
+///     `radarResidual` below, but for the state itself rather than a
+///     measurement. Without this, `yaw` just accumulates additively forever
+///     (harmless for `sin`/`cos`, which are periodic either way, but an
+///     ever-growing raw state is still not what anything downstream of this
+///     filter wants to see).
+///   - `v` (index 2) is clamped to `>= 0` -- see `gps_ins.inject`'s doc
+///     comment for the full reasoning (same model family, same physical
+///     constraint: this model's `f` has no reverse-gear term either, so a
+///     negative `v` means the filter pointed velocity 180 degrees off
+///     rather than that the object is inching backward). It's a no-op on
+///     this benchmark's own synthetic dataset -- `v` never actually dips
+///     negative here, unlike `gps_ins`'s real, noisier KITTI data -- kept
+///     anyway since it's the same real constraint this model has, and
+///     costs nothing to enforce when it doesn't trigger.
+///
+/// `jacobianF`/`radarJacobianH` already only consume `yaw` through
+/// `sin`/`cos`, so neither adjustment changes any other filter's behavior
+/// -- `ExtendedKalmanFilter`/`IteratedExtendedKalmanFilter`/
+/// `UnscentedKalmanFilter`/`SquareRootKalmanFilter` never look up `inject`
+/// by name, so adding it here is invisible to them.
+pub fn inject(x: StateVec, dx: StateVec) StateVec {
+    var out = StateVec.zero();
+    for (0..5) |i| out.data[i][0] = x.data[i][0] + dx.data[i][0];
+    out.data[3][0] = normalizeAngle(out.data[3][0]);
+    if (out.data[2][0] < 0) out.data[2][0] = 0;
+    return out;
+}
+
+/// Wrapping-by-a-multiple-of-2*pi is a translation, so its Jacobian is the
+/// identity everywhere -- same reasoning `error_state_kalman.zig`'s own
+/// wrap-based test uses for why this can stay the default rather than
+/// needing its own override.
+pub fn resetJacobian(dx: StateVec) StateMat {
+    _ = dx;
+    return maryam.I(5);
+}
+
 /// Radar's `z - h(x)` residual, with the bearing (theta) component
 /// angle-wrapped -- see `extended_kalman.ExtendedKalmanFilter.residual`.
 pub fn radarResidual(z: RadarVec, h_x: RadarVec) RadarVec {
@@ -227,21 +268,31 @@ const Self = @This();
 
 /// `Model` for `ExtendedKalmanFilter(5, 1, 2, ctrv.LidarModel)`: lidar's
 /// measurement is linear (direct px/py), so no residual override is needed.
+/// `inject`/`resetJacobian` are only ever looked up by
+/// `error_state_kalman.ErrorStateKalmanFilter`; every other filter in this
+/// package ignores them.
 pub const LidarModel = struct {
     pub const f = Self.f;
     pub const jacobianF = Self.jacobianF;
     pub const h = Self.lidarH;
     pub const jacobianH = Self.lidarJacobianH;
+    pub const inject = Self.inject;
+    pub const resetJacobian = Self.resetJacobian;
 };
 
 /// `Model` for `ExtendedKalmanFilter(5, 1, 3, ctrv.RadarModel)`: radar's
 /// bearing measurement wraps around, so this supplies `residual` too.
+/// `inject`/`resetJacobian` are only ever looked up by
+/// `error_state_kalman.ErrorStateKalmanFilter`; every other filter in this
+/// package ignores them.
 pub const RadarModel = struct {
     pub const f = Self.f;
     pub const jacobianF = Self.jacobianF;
     pub const h = Self.radarH;
     pub const jacobianH = Self.radarJacobianH;
     pub const residual = Self.radarResidual;
+    pub const inject = Self.inject;
+    pub const resetJacobian = Self.resetJacobian;
 };
 
 test "radarJacobianH matches finite-difference derivatives of radarH" {
@@ -330,4 +381,17 @@ test "normalizeAngle handles multi-wrap and exact-boundary inputs" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), normalizeAngle(4 * std.math.pi), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.1), normalizeAngle(0.1 - 4 * std.math.pi), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, -std.math.pi + 0.1), normalizeAngle(std.math.pi + 0.1), 1e-9);
+}
+
+test "inject clamps v to 0 when the correction would push it negative, leaves it alone otherwise" {
+    var x = StateVec.zero();
+    x.data[2][0] = 0.5; // v = 0.5
+
+    var small_dx = StateVec.zero();
+    small_dx.data[2][0] = -0.2; // v would land at 0.3 -- still positive
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), inject(x, small_dx).data[2][0], 1e-12);
+
+    var large_dx = StateVec.zero();
+    large_dx.data[2][0] = -0.8; // v would land at -0.3 -- clamped to 0
+    try std.testing.expectEqual(@as(f64, 0.0), inject(x, large_dx).data[2][0]);
 }

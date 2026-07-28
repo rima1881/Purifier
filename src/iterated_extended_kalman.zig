@@ -3,9 +3,10 @@
 //! at successively better state estimates instead of just once at the
 //! predicted state -- a Gauss-Newton correction for measurements too
 //! nonlinear for a single linearization pass to track well. `Model`'s
-//! interface is identical to the EKF's (`f`/`jacobianF`/`h`/`jacobianH`,
-//! optional `residual`) -- any `Model` already written for the EKF works
-//! here unchanged.
+//! interface is identical to the EKF's: `f`/`jacobianF`/`h`/`jacobianH`
+//! (optional `residual`) -- these are properties of the system being
+//! estimated, not of which filter algorithm consumes them, so any `Model`
+//! already written for the EKF works here unchanged.
 //!
 //! Iteration is the standard IEKF/Gauss-Newton form: starting from
 //! `x_0 = x_pred` (the ordinary EKF `predict()` result), each step `i`

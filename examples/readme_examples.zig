@@ -9,6 +9,7 @@ const extended_kalman = Purifier.extended_kalman;
 const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
+const error_state_kalman = Purifier.error_state_kalman;
 const maryam = @import("maryam");
 
 test "Readme.md: linear KalmanFilter example" {
@@ -274,6 +275,63 @@ test "Readme.md: SquareRootKalmanFilter example" {
     };
 
     try filter.predict(Vec1.zero()); // no control input this step
+    var z = Vec1.zero();
+    z.data[0][0] = 0.5; // measured sin(x) = 0.5
+    try filter.update(z);
+
+    try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+
+test "Readme.md: ErrorStateKalmanFilter example" {
+    // Same model and Jacobians as the ExtendedKalmanFilter example above --
+    // ErrorStateKalmanFilter takes the exact same Model interface, so any
+    // Model already written for the EKF works here unchanged, and behaves
+    // identically to it unless Model also supplies inject/resetJacobian.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const ESKF = error_state_kalman.ErrorStateKalmanFilter(1, 1, 1, Model);
+
+    var filter = ESKF{
+        .x = Vec1.zero(),
+        .P = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            break :blk m;
+        },
+        .Q = Vec1.zero(),
+        .R = blk: {
+            var m = Vec1.zero();
+            m.data[0][0] = 0.1;
+            break :blk m;
+        },
+    };
+
+    filter.predict(Vec1.zero()); // no control input this step
     var z = Vec1.zero();
     z.data[0][0] = 0.5; // measured sin(x) = 0.5
     try filter.update(z);

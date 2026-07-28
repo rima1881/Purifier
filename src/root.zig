@@ -14,6 +14,7 @@ pub const extended_kalman = @import("extended_kalman.zig");
 pub const iterated_extended_kalman = @import("iterated_extended_kalman.zig");
 pub const unscented_kalman = @import("unscented_kalman.zig");
 pub const square_root_kalman = @import("square_root_kalman.zig");
+pub const error_state_kalman = @import("error_state_kalman.zig");
 
 // Re-exported so consumers of this package can build `StateVec`/`StateMat`/
 // etc. values (`maryam.MatrixType(n, m)`) without also having to add maryam

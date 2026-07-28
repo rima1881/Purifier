@@ -10,14 +10,19 @@ const kalman_core = @import("kalman_core.zig");
 ///
 /// `Model` is a comptime namespace (not a runtime value), matching every
 /// other generic in this package (`kalman.KalmanFilter`, `maryam.Equation`)
-/// being fully monomorphized with no runtime dispatch. It must provide:
+/// being fully monomorphized with no runtime dispatch. `f`/`jacobianF`/`h`/
+/// `jacobianH` are properties of the system being estimated (the state
+/// transition, its derivative, the measurement function, its derivative) --
+/// identical regardless of which filter algorithm consumes them, so every
+/// nonlinear filter in this package looks up the same names, not a
+/// filter-specific one. `ExtendedKalmanFilter` needs:
 ///   - `f(x: StateVec, u: ControlVec) StateVec`         -- state transition
 ///   - `jacobianF(x: StateVec, u: ControlVec) StateMat` -- d(f)/d(x)
 ///   - `h(x: StateVec) MeasureVec`                       -- measurement model
 ///   - `jacobianH(x: StateVec) MeasureMat`               -- d(h)/d(x)
 /// and may optionally provide:
 ///   - `residual(z: MeasureVec, h_x: MeasureVec) MeasureVec` -- innovation
-///     `z - h(x)`, defaulting to plain subtraction if omitted. Override this
+///     `z - h(x)`, defaulting to plain subtraction if omitted. Override it
 ///     when a measurement dimension wraps around (e.g. a bearing angle):
 ///     naive subtraction near a wraparound boundary can produce a huge
 ///     spurious residual for what's actually a tiny real difference

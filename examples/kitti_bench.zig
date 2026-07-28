@@ -29,6 +29,7 @@ const extended_kalman = Purifier.extended_kalman;
 const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
+const error_state_kalman = Purifier.error_state_kalman;
 const gps_ins = @import("gps_ins.zig");
 const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
@@ -140,6 +141,13 @@ const BicycleIEKF = iterated_extended_kalman.IteratedExtendedKalmanFilter(4, 3, 
 const BicycleUKF = unscented_kalman.UnscentedKalmanFilter(4, 3, 2, gps_ins.GpsModel);
 const BicycleSRKF = square_root_kalman.SquareRootKalmanFilter(4, 3, 2, gps_ins.GpsModel);
 
+// Reuses gps_ins.GpsModel unchanged too: it now also supplies
+// `inject`/`resetJacobian` (see gps_ins.zig), which only
+// ErrorStateKalmanFilter consumes -- the four filter types above never look
+// those decls up, so adding them didn't change anything about their
+// behavior.
+const BicycleESKF = error_state_kalman.ErrorStateKalmanFilter(4, 3, 2, gps_ins.GpsModel);
+
 // Same values used to independently validate this model against filterpy
 // (see maryam_fix.md / Readme.md for how that comparison was produced) --
 // left exactly as originally chosen so that validation stays reproducible.
@@ -154,22 +162,25 @@ const ekf_std_wu_untuned = 0.2; // process-noise std for the yaw-rate input, rad
 const ekf_std_af_alt = 0.15;
 const ekf_std_wu_alt = 0.03;
 
-// Shared by the EKF, IEKF, UKF, and SR-KF configurations below: only the
-// filter type (`Filter`) and initial v/yaw covariance differ, everything
+// Shared by the EKF, IEKF, UKF, SR-KF, and ESKF configurations below: only
+// the filter type (`Filter`) and initial v/yaw covariance differ, everything
 // else -- dataset parsing, dt/Q computation, error accumulation -- is
 // identical. `bench_common.predictErr` absorbs one structural difference
-// (EKF's and IEKF's predict() can't fail; UKF's and SR-KF's can), and
-// `bench_common.makeFilter`/`covOf` absorb another (SR-KF's field is `L`,
-// not `P`). IEKF needs no changes here at all -- same `predict()`/`update()`
-// signatures as the plain EKF.
+// (EKF's, IEKF's, and ESKF's predict() can't fail; UKF's and SR-KF's can),
+// and `bench_common.makeFilter`/`covOf` absorb another (SR-KF's field is
+// `L`, not `P`). IEKF and ESKF need no changes here at all -- both have the
+// same `predict()`/`update()` signatures as the plain EKF.
 //
 // `initial_vyaw_cov` exists because the "right" initial value is NOT the
 // same number for every filter, unlike everywhere else in this codebase
 // where P's exact magnitude doesn't matter as long as it's "wide":
-//   - EKF/linear/IEKF use P purely algebraically, so P[2][2]=P[3][3]=1000
-//     (no prior belief about v/yaw) is harmless -- IEKF re-linearizes H at
-//     better state estimates, but never samples a point far from the mean
-//     the way the UKF does, so it has no analogous sensitivity.
+//   - EKF/linear/IEKF/ESKF use P purely algebraically, so
+//     P[2][2]=P[3][3]=1000 (no prior belief about v/yaw) is harmless --
+//     IEKF re-linearizes H at better state estimates, but never samples a
+//     point far from the mean the way the UKF does, so it has no analogous
+//     sensitivity; ESKF's `gps_ins.inject` only wraps `yaw` into (-pi, pi]
+//     after each correction, which doesn't interact with P's initial scale
+//     at all.
 //   - UKF's sigma points are genuinely sampled at mean +- sqrt(n+lambda)*
 //     sigma, and sqrt(1000)*spread(~2) is ~63 -- for `yaw`, a periodic
 //     quantity, 63 radians wraps around 2*pi about ten times, landing sigma
@@ -274,6 +285,7 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     const bicycle_iekf = try runBicyclePair(BicycleIEKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
     const bicycle_ukf = try runBicyclePair(BicycleUKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1);
     const bicycle_srkf = try runBicyclePair(BicycleSRKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, @sqrt(1000.0));
+    const bicycle_eskf = try runBicyclePair(BicycleESKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
 
     try w.print("dataset: KITTI 2011_09_26_drive_0005 (real vehicle trajectory, 154 frames @ ~9.6Hz)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, GPS only (no IMU)", linear);
@@ -282,17 +294,18 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     try report(w, "Bicycle IEKF, max 3 iterations (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_iekf);
     try report(w, "Bicycle UKF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_ukf);
     try report(w, "Bicycle SR-KF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_srkf);
+    try report(w, "Bicycle ESKF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_eskf);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0], bicycle_iekf.rmse[0], bicycle_ukf.rmse[0], bicycle_srkf.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1], bicycle_iekf.rmse[1], bicycle_ukf.rmse[1], bicycle_srkf.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2], bicycle_iekf.rmse[2], bicycle_ukf.rmse[2], bicycle_srkf.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3], bicycle_iekf.rmse[3], bicycle_ukf.rmse[3], bicycle_srkf.rmse[3] });
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0], bicycle_iekf.rmse[0], bicycle_ukf.rmse[0], bicycle_srkf.rmse[0], bicycle_eskf.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1], bicycle_iekf.rmse[1], bicycle_ukf.rmse[1], bicycle_srkf.rmse[1], bicycle_eskf.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2], bicycle_iekf.rmse[2], bicycle_ukf.rmse[2], bicycle_srkf.rmse[2], bicycle_eskf.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3], bicycle_iekf.rmse[3], bicycle_ukf.rmse[3], bicycle_srkf.rmse[3], bicycle_eskf.rmse[3] });
 
     if (builtin.os.tag != .windows) {
         const ru = std.posix.getrusage(std.posix.rusage.SELF);
         const peak_kb: i64 = if (builtin.os.tag == .macos) @divTrunc(ru.maxrss, 1024) else ru.maxrss;
-        try w.print("\nprocess peak RSS = {d} KB (whole program, all six filters + both benchmarks)\n", .{peak_kb});
+        try w.print("\nprocess peak RSS = {d} KB (whole program, all seven filters + both benchmarks)\n", .{peak_kb});
     }
 
     try w.flush();

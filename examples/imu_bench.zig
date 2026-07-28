@@ -10,10 +10,11 @@
 //!
 //! `extended_kalman.ExtendedKalmanFilter`,
 //! `iterated_extended_kalman.IteratedExtendedKalmanFilter`,
-//! `unscented_kalman.UnscentedKalmanFilter`, and
-//! `square_root_kalman.SquareRootKalmanFilter` all use a CTRV (constant turn
+//! `unscented_kalman.UnscentedKalmanFilter`,
+//! `square_root_kalman.SquareRootKalmanFilter`, and
+//! `error_state_kalman.ErrorStateKalmanFilter` all use a CTRV (constant turn
 //! rate and velocity) model (see `ctrv.zig`) with a genuinely nonlinear
-//! radar measurement model, so all four consume *all* 500 rows.
+//! radar measurement model, so all five consume *all* 500 rows.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,6 +25,7 @@ const extended_kalman = Purifier.extended_kalman;
 const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
+const error_state_kalman = Purifier.error_state_kalman;
 const ctrv = @import("ctrv.zig");
 const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
@@ -136,6 +138,14 @@ const RadarUKF = unscented_kalman.UnscentedKalmanFilter(5, 1, 3, ctrv.RadarModel
 const LidarSRKF = square_root_kalman.SquareRootKalmanFilter(5, 1, 2, ctrv.LidarModel);
 const RadarSRKF = square_root_kalman.SquareRootKalmanFilter(5, 1, 3, ctrv.RadarModel);
 
+// Reuses ctrv.LidarModel/ctrv.RadarModel unchanged too: they now also
+// supply `inject`/`resetJacobian` (see ctrv.zig), which only
+// ErrorStateKalmanFilter consumes -- the EKF/IEKF/UKF/SR-KF instances above
+// never look those decls up, so adding them didn't change anything about
+// this file's other five filter types.
+const LidarESKF = error_state_kalman.ErrorStateKalmanFilter(5, 1, 2, ctrv.LidarModel);
+const RadarESKF = error_state_kalman.ErrorStateKalmanFilter(5, 1, 3, ctrv.RadarModel);
+
 // max_iterations = 3, chosen empirically: swept 1/2/3/4/5/8/10 on this
 // dataset and the result is *not* monotonic (a known property of
 // undamped/vanilla Gauss-Newton IEKF -- with no step damping or line
@@ -177,16 +187,17 @@ const ekf_R_radar: ctrv.RadarNoise = blk: {
     break :blk m;
 };
 
-// Shared by the EKF, IEKF, UKF, and SR-KF configurations below: only the
-// filter types (`Lidar`/`Radar`) differ between them, everything else --
+// Shared by the EKF, IEKF, UKF, SR-KF, and ESKF configurations below: only
+// the filter types (`Lidar`/`Radar`) differ between them, everything else --
 // dataset parsing, initialization, dt/Q computation, error accumulation --
 // is identical. `bench_common.predictErr` absorbs one real behavioral
-// difference (EKF's and IEKF's predict() can't fail; UKF's and SR-KF's can,
-// since both run a Cholesky decomposition), and
+// difference (EKF's, IEKF's, and ESKF's predict() can't fail; UKF's and
+// SR-KF's can, since both run a Cholesky decomposition), and
 // `bench_common.makeFilter`/`covOf` absorb another (SR-KF's
 // covariance-representation field is named `L`, not `P`, since it stores a
-// Cholesky factor rather than P itself). IEKF needs no changes here at all
-// -- its `predict()`/`update()` signatures are identical to the plain EKF's.
+// Cholesky factor rather than P itself). IEKF and ESKF need no changes here
+// at all -- both have `predict()`/`update()` signatures identical to the
+// plain EKF's.
 fn runFilterPair(comptime Lidar: type, comptime Radar: type, io: Io, std_a: f64, std_yawdd: f64) !BenchResult {
     var x = ctrv.StateVec.zero();
     var cov = maryam.I(5);
@@ -296,6 +307,10 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     const iekf = try runFilterPair(LidarIEKF, RadarIEKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
     const ukf = try runFilterPair(LidarUKF, RadarUKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
     const srkf = try runFilterPair(LidarSRKF, RadarSRKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
+    // Same untuned Q as the plain EKF, same reasoning as IEKF/UKF/SR-KF
+    // above: isolates exactly what ErrorStateKalmanFilter changes (state
+    // composition through ctrv.inject) rather than also varying Q.
+    const eskf = try runFilterPair(LidarESKF, RadarESKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
 
     try w.print("dataset: 250 lidar rows, 250 radar rows (all filters see the same data)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, lidar only", linear);
@@ -304,14 +319,15 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     try report(w, "Iterated EKF, max 3 iterations (same Q as untuned EKF) -- CTRV model, lidar + radar", iekf);
     try report(w, "Unscented KF (same Q as untuned EKF) -- CTRV model, lidar + radar", ukf);
     try report(w, "Square-Root KF (same Q as untuned EKF) -- CTRV model, lidar + radar", srkf);
+    try report(w, "Error-State KF (same Q as untuned EKF) -- CTRV model, lidar + radar", eskf);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0], iekf.rmse[0], ukf.rmse[0], srkf.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1], iekf.rmse[1], ukf.rmse[1], srkf.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2], iekf.rmse[2], ukf.rmse[2], srkf.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3], iekf.rmse[3], ukf.rmse[3], srkf.rmse[3] });
-    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
-        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle, iekf.avg_ns_per_cycle, ukf.avg_ns_per_cycle, srkf.avg_ns_per_cycle,
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0], iekf.rmse[0], ukf.rmse[0], srkf.rmse[0], eskf.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1], iekf.rmse[1], ukf.rmse[1], srkf.rmse[1], eskf.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2], iekf.rmse[2], ukf.rmse[2], srkf.rmse[2], eskf.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3], iekf.rmse[3], ukf.rmse[3], srkf.rmse[3], eskf.rmse[3] });
+    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
+        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle, iekf.avg_ns_per_cycle, ukf.avg_ns_per_cycle, srkf.avg_ns_per_cycle, eskf.avg_ns_per_cycle,
     });
 
     if (builtin.os.tag != .windows) {

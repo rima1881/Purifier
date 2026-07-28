@@ -1,12 +1,11 @@
 //! Unscented Kalman Filter: propagates a small, deterministically-chosen set
 //! of "sigma points" through the actual nonlinear `f`/`h` (no linearization,
 //! no derivatives) and reconstructs mean/covariance from their weighted
-//! statistics. `Model` only needs `f(x, u) -> StateVec` and
+//! statistics. `Model` must provide `f(x, u) -> StateVec` and
 //! `h(x) -> MeasureVec` -- no `jacobianF`/`jacobianH`, unlike
 //! `extended_kalman.ExtendedKalmanFilter`. This means any `Model` already
-//! written for the EKF (e.g. `ctrv.RadarModel`, `gps_ins.GpsModel`) works
-//! here unchanged -- the extra `jacobianF`/`jacobianH` decls are simply
-//! never referenced.
+//! written for the EKF works here unchanged (the extra `jacobianF`/
+//! `jacobianH` decls are simply never referenced).
 //!
 //! Uses the standard additive-noise formulation: sigma points come from the
 //! Cholesky factor of `P` alone (not augmented with `Q`/`R`), and process/
