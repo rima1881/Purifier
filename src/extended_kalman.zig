@@ -47,6 +47,13 @@ pub fn ExtendedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: us
         Q: Core.StateMat, // (n x n) Process noise
         R: Core.MeasureNoise, // (m x m) Measurement noise
 
+        // Recorded by the most recent update() -- see kalman.zig's
+        // `last_K`/`last_y`/`last_S` fields for why this exists on every
+        // filter variant (generic wrappers like `adaptive_kalman.AdaptiveKalmanFilter`).
+        last_K: Core.GainMat = undefined,
+        last_y: Core.MeasureVec = undefined,
+        last_S: Core.MeasureNoise = undefined,
+
         pub fn predict(self: *Self, u: ControlVec) void {
             const F = Model.jacobianF(self.x, u);
             self.x = Model.f(self.x, u);
@@ -60,6 +67,9 @@ pub fn ExtendedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: us
             const y = residual(z, Model.h(self.x));
             self.x = Core.ApplyGain.eval(.{ .x = self.x, .K = K, .y = y });
             self.P = Core.UpdateP.eval(.{ .I = maryam.I(n), .K = K, .H = H, .P = self.P, .R = self.R });
+            self.last_K = K;
+            self.last_y = y;
+            self.last_S = S;
         }
     };
 }

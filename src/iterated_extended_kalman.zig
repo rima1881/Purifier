@@ -75,6 +75,15 @@ pub fn IteratedExtendedKalmanFilter(comptime n: usize, comptime k: usize, compti
         Q: Core.StateMat, // (n x n) Process noise
         R: Core.MeasureNoise, // (m x m) Measurement noise
 
+        // Recorded by the most recent update() -- see kalman.zig's
+        // `last_K`/`last_y`/`last_S` fields for why this exists on every
+        // filter variant (generic wrappers like `adaptive_kalman.AdaptiveKalmanFilter`).
+        // The *final* iteration's `K_i`/`y_i`/`S_i`: `self.x - x_pred =
+        // K_i @ y_i` exactly, by construction of the iteration below.
+        last_K: Core.GainMat = undefined,
+        last_y: Core.MeasureVec = undefined,
+        last_S: Core.MeasureNoise = undefined,
+
         pub fn predict(self: *Self, u: ControlVec) void {
             const F = Model.jacobianF(self.x, u);
             self.x = Model.f(self.x, u);
@@ -86,16 +95,18 @@ pub fn IteratedExtendedKalmanFilter(comptime n: usize, comptime k: usize, compti
             var x_i = x_pred;
             var H_i: Core.MeasureMat = undefined;
             var K_i: Core.GainMat = undefined;
+            var y_i: Core.MeasureVec = undefined;
+            var S_i: Core.MeasureNoise = undefined;
 
             var iter: usize = 0;
             while (iter < max_iterations) : (iter += 1) {
                 H_i = Model.jacobianH(x_i);
-                const S = Core.InnovationS.eval(.{ .H = H_i, .P = self.P, .R = self.R });
-                K_i = try Core.KalmanGainK.eval(.{ .S = S, .H = H_i, .P = self.P });
+                S_i = Core.InnovationS.eval(.{ .H = H_i, .P = self.P, .R = self.R });
+                K_i = try Core.KalmanGainK.eval(.{ .S = S_i, .H = H_i, .P = self.P });
 
                 const raw = residual(z, Model.h(x_i));
                 const dx = StateDelta.eval(.{ .a = x_pred, .b = x_i });
-                const y_i = IterResidual.eval(.{ .raw = raw, .H = H_i, .dx = dx });
+                y_i = IterResidual.eval(.{ .raw = raw, .H = H_i, .dx = dx });
 
                 const x_next = Core.ApplyGain.eval(.{ .x = x_pred, .K = K_i, .y = y_i });
                 const step = StateDelta.eval(.{ .a = x_next, .b = x_i });
@@ -106,6 +117,9 @@ pub fn IteratedExtendedKalmanFilter(comptime n: usize, comptime k: usize, compti
 
             self.x = x_i;
             self.P = Core.UpdateP.eval(.{ .I = maryam.I(n), .K = K_i, .H = H_i, .P = self.P, .R = self.R });
+            self.last_K = K_i;
+            self.last_y = y_i;
+            self.last_S = S_i;
         }
     };
 }

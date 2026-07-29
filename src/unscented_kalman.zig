@@ -23,9 +23,13 @@
 //! The final covariance update, `P = P - K @ S @ K^T`, is the textbook
 //! unscented form (matches every reference implementation, including
 //! filterpy's) -- unlike `KalmanCore`'s Joseph-form update, it isn't
-//! guaranteed to stay symmetric/PSD under floating-point error. A
-//! square-root UKF (propagating a Cholesky factor of `P` directly, sidestepping
-//! this) is on the roadmap in Readme.md but not implemented here.
+//! guaranteed to stay positive-semidefinite under floating-point error, and
+//! `update()` symmetrizes the result (`P = 0.5 * (P + P^T)`) afterward to at
+//! least guarantee the symmetry half, since `predict()`'s sigma points need
+//! a Cholesky factor of `P` and `choleskyMatrix` requires an (exactly)
+//! symmetric input. A square-root UKF (propagating a Cholesky factor of `P`
+//! directly, sidestepping the PSD half of this too) is on the roadmap in
+//! Readme.md but not implemented here.
 //!
 //! Every fixed-shape matrix computation below goes through `maryam.Equation`
 //! rather than calling `maryam.operation.*` directly, matching
@@ -126,8 +130,20 @@ pub fn UnscentedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: u
 
         // Textbook (non-Joseph) covariance update -- see the module doc
         // comment above for why this, unlike `KalmanCore.UpdateP`, isn't
-        // guaranteed to stay symmetric/PSD under floating-point error.
+        // guaranteed to stay positive-semidefinite under floating-point
+        // error. `Symmetrize` (applied right after, in `update()` below)
+        // fixes the symmetry half of that: `K @ S @ K^T` is symmetric in
+        // exact arithmetic, but the matrix-multiply order `Equation`
+        // generates for it isn't guaranteed to produce `P[i][j] ==
+        // P[j][i]` bit-for-bit once rounding is involved, and a `P` that's
+        // even slightly asymmetric will fail `choleskyMatrix` the next time
+        // `predict()` tries to draw sigma points from it. This doesn't
+        // restore the PSD guarantee Joseph form has -- a genuinely negative
+        // eigenvalue introduced by rounding would still be a negative
+        // eigenvalue after averaging with its own transpose -- only the
+        // symmetry half.
         const UpdateP = maryam.Equation("P - K @ S @ K^T", struct { P: Core.StateMat, K: CrossCov, S: Core.MeasureNoise });
+        const Symmetrize = maryam.Equation("0.5 * (P + P^T)", struct { P: Core.StateMat });
 
         const AddProcessNoise = maryam.Equation("cov + Q", struct { cov: Core.StateMat, Q: Core.StateMat });
         const AddMeasureNoise = maryam.Equation("s + R", struct { s: Core.MeasureNoise, R: Core.MeasureNoise });
@@ -144,6 +160,13 @@ pub fn UnscentedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: u
 
         Q: Core.StateMat, // (n x n) Process noise
         R: Core.MeasureNoise, // (m x m) Measurement noise
+
+        // Recorded by the most recent update() -- see kalman.zig's
+        // `last_K`/`last_y`/`last_S` fields for why this exists on every
+        // filter variant (generic wrappers like `adaptive_kalman.AdaptiveKalmanFilter`).
+        last_K: Core.GainMat = undefined,
+        last_y: Core.MeasureVec = undefined,
+        last_S: Core.MeasureNoise = undefined,
 
         // Sigma points from the *predicted* state, stashed by predict() and
         // consumed by update() -- the standard UKF reuses these rather than
@@ -217,7 +240,11 @@ pub fn UnscentedKalmanFilter(comptime n: usize, comptime k: usize, comptime m: u
             // sigma-point statistics. So this reuses Core.ApplyGain directly
             // instead of redeclaring an identical equation.
             self.x = Core.ApplyGain.eval(.{ .x = self.x, .K = gain, .y = y });
-            self.P = Eq.UpdateP.eval(.{ .P = self.P, .K = gain, .S = s });
+            const p_updated = Eq.UpdateP.eval(.{ .P = self.P, .K = gain, .S = s });
+            self.P = Eq.Symmetrize.eval(.{ .P = p_updated });
+            self.last_K = gain;
+            self.last_y = y;
+            self.last_S = s;
         }
     };
 }
@@ -279,4 +306,63 @@ test "1D nonlinear-measurement filter matches a hand-derived closed form for h(x
     try filter.update(scalar(0.5));
     try std.testing.expectApproxEqAbs(expected_x, filter.x.data[0][0], 1e-9);
     try std.testing.expectApproxEqAbs(expected_p, filter.P.data[0][0], 1e-9);
+}
+
+test "update() leaves P exactly symmetric even with a genuinely coupled, off-diagonal covariance" {
+    // A 2-state, 2-measurement model whose h mixes both state components
+    // nonlinearly, so K @ S @ K^T has real off-diagonal terms -- P[0][1] and
+    // P[1][0] are each the result of an independently-rounded dot product
+    // (different row/column traversal order), which IEEE754 doesn't
+    // guarantee to agree bit-for-bit even though they're mathematically the
+    // same value. Without `Eq.Symmetrize`, this is exactly the scenario that
+    // can leave `P` slightly asymmetric and make the next `predict()`'s
+    // `choleskyMatrix` call (which requires an exactly symmetric input)
+    // needlessly fragile.
+    const Vec2 = maryam.MatrixType(2, 1);
+    const Mat2 = maryam.MatrixType(2, 2);
+
+    const vec = struct {
+        fn of(a: f64, b: f64) Vec2 {
+            var v = Vec2.zero();
+            v.data[0][0] = a;
+            v.data[1][0] = b;
+            return v;
+        }
+    }.of;
+
+    const Model = struct {
+        pub fn f(x: Vec2, u: Vec2) Vec2 {
+            _ = u;
+            return x;
+        }
+        pub fn h(x: Vec2) Vec2 {
+            return vec(x.data[0][0] + x.data[1][0], @sin(x.data[0][0] - x.data[1][0]));
+        }
+    };
+
+    const UKF = UnscentedKalmanFilter(2, 2, 2, Model);
+
+    var filter = UKF{
+        .x = vec(0.3, -0.2),
+        .P = blk: {
+            var m = Mat2.zero();
+            m.data[0][0] = 1.0;
+            m.data[0][1] = 0.4;
+            m.data[1][0] = 0.4;
+            m.data[1][1] = 0.8;
+            break :blk m;
+        },
+        .Q = Mat2.zero(),
+        .R = blk: {
+            var m = Mat2.zero();
+            m.data[0][0] = 0.05;
+            m.data[1][1] = 0.05;
+            break :blk m;
+        },
+    };
+
+    try filter.predict(vec(0, 0));
+    try filter.update(vec(0.6, 0.1));
+
+    try std.testing.expectEqual(filter.P.data[0][1], filter.P.data[1][0]);
 }

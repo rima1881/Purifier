@@ -19,32 +19,36 @@
 //! `cond(P) = cond(L)^2` -- the actual point of a square-root filter, unlike
 //! `predict()` below.
 //!
-//! `predict()` still round-trips through `P = L @ L^T`, honestly for a
-//! specific reason: a real QR-based predict step needs a square root of `Q`
-//! (`Q1_2`, so `[F @ L | Q1_2]` can be QR'd the same way `update()`'s `M`
-//! is), but every process-noise `Q` this repo actually builds
-//! (`ctrv.processNoise`, `gps_ins.processNoise`) is constructed as
-//! `G @ Qv @ G^T` from a low-dimensional white-noise source (2 independent
-//! noise channels injected into a 4- or 5-dim state) and is therefore
-//! always rank-deficient. Neither `operation.choleskyMatrix` (needs strict
-//! positive-definiteness) nor `operation.sqrtMatrix` (Denman-Beavers,
-//! starts by inverting `Q` itself) can factor a rank-deficient matrix, so
-//! there's no `Q1_2` to feed a QR-based predict step for these particular
-//! models -- not a maryam gap, a property of the models. `predict()`
+//! `predict()` takes the same kind of genuine QR-based route as `update()`
+//! whenever it can: given `Q1_2` (a Cholesky factor of `Q`, `Q1_2 @ Q1_2^T =
+//! Q`), `P' = F@P@F^T + Q = (F@L)(F@L)^T + Q1_2@Q1_2^T`, so stacking `A =
+//! [(F @ L)^T; Q1_2^T]` into a `2n x n` matrix and QR-decomposing it
+//! (`A = Qq @ R`) gives `A^T @ A = R^T @ R` (`Qq` is orthogonal) -- and since
+//! `R`'s bottom `n` rows are zero, that's `U^T @ U` for `U`, `R`'s top
+//! `n x n` block, so `L' = U^T` is a valid square root of `P'` without ever
+//! reconstructing `P'`. This needs `Q1_2` to exist, i.e. `Q` to be
+//! (strictly) positive-definite -- every process-noise `Q` this repo
+//! actually builds (`ctrv.processNoise`, `gps_ins.processNoise`) is
+//! constructed as `G @ Qv @ G^T` from a low-dimensional white-noise source
+//! (2 independent noise channels injected into a 4- or 5-dim state) and is
+//! therefore always rank-deficient, so those models always fall through to
+//! the fallback below instead -- not a maryam gap, a property of the
+//! models. When `Q` isn't (detectably) positive-definite, `predict()`
 //! reconstructs `P` from `L`, runs the *exact same* Joseph-form recursion
 //! `kalman_core.KalmanCore` provides, and re-factors the result back into
 //! `L` via `choleskyMatrix`, which either succeeds or reports
 //! `error.NotPositiveDefinite` -- a real, different benefit (every step's
 //! `P` is validated as genuinely SPD, or the filter fails fast) from the
-//! numerical-conditioning one `update()` now gets, but not that one.
+//! numerical-conditioning benefit the QR path gets, but not that one.
 //!
-//! One visible consequence of `update()`'s Householder-based construction:
-//! `L`'s diagonal sign is whatever the QR reflection convention happens to
-//! produce (not necessarily non-negative the way `predict()`'s
-//! Cholesky-derived `L` is). This doesn't affect correctness -- `L` is only
-//! ever used via `L @ L^T` or `H @ L`, both sign-invariant -- but a reader
-//! inspecting `.L` directly after an `update()` call may see a different
-//! sign than after a `predict()` call.
+//! One visible consequence of either function's Householder-based
+//! construction (`update()` always, `predict()` whenever it takes the QR
+//! path above): `L`'s diagonal sign is whatever the QR reflection
+//! convention happens to produce (not necessarily non-negative the way
+//! `predict()`'s Cholesky-fallback-derived `L` is). This doesn't affect
+//! correctness -- `L` is only ever used via `L @ L^T` or `H @ L`, both
+//! sign-invariant -- but a reader inspecting `.L` directly after a QR-path
+//! call may see a different sign than after the Cholesky fallback.
 
 const std = @import("std");
 const maryam = @import("maryam");
@@ -56,15 +60,20 @@ pub fn SquareRootKalmanFilter(comptime n: usize, comptime k: usize, comptime m: 
     const ControlVec = maryam.MatrixType(k, 1);
     const GainN = maryam.MatrixType(m, m);
     const Augmented = maryam.MatrixType(m + n, m + n);
+    // The predict-side augmented matrix: `[(F @ L)^T; Q1_2^T]` stacked
+    // vertically, `2n x n` -- see `predict()` below.
+    const PredictAugmented = maryam.MatrixType(2 * n, n);
 
     const residual = kalman_core.defaultResidual(Model, Core.MeasureVec);
 
-    // P = L @ L^T -- the one non-DSL-avoidable reconstruction predict()
-    // performs every call (see the module doc comment above for why: Q's
-    // rank-deficiency in this repo's models blocks a QR-based predict).
+    // P = L @ L^T -- the fallback reconstruction predict() performs when Q
+    // has no Cholesky factor (see the module doc comment above for why
+    // every Q this repo's own models build is rank-deficient and always
+    // takes this path).
     const ReformP = maryam.Equation("L @ L^T", struct { L: Core.StateMat });
 
     const HL = maryam.Equation("H @ L", struct { H: Core.MeasureMat, L: Core.StateMat });
+    const FL = maryam.Equation("F @ L", struct { F: Core.StateMat, L: Core.StateMat });
 
     // x + K @ N^-1 @ y, written with the inverse leading into a `@` chain
     // so `Equation` solves `N @ w = y` and computes `K @ w` instead of
@@ -76,6 +85,26 @@ pub fn SquareRootKalmanFilter(comptime n: usize, comptime k: usize, comptime m: 
         N: GainN,
         y: Core.MeasureVec,
     });
+
+    // The *effective* gain -- `dx = EffectiveGain @ y`, matching what every
+    // other filter variant's `last_K` means (see kalman.zig's doc comment).
+    // `ApplyGain` above never materializes this on its own path (its trailing
+    // `N^-1 @ y` gets fused into a solve instead), so this is a second,
+    // dedicated computation purely for that bookkeeping -- `N^-1` here has
+    // nothing chained after it, so `Equation` does materialize the explicit
+    // inverse (see maryam_fix.md item 2), which is fine off the hot path.
+    const EffectiveGain = maryam.Equation("K @ N^-1", struct { K: Core.GainMat, N: GainN });
+
+    // `last_S` -- see kalman.zig's doc comment on why every filter variant
+    // exposes this. `N` (the top-left m x m block of the augmented QR's
+    // upper-triangular factor) is a square root of the innovation
+    // covariance by construction of the Potter/Carlson recursion above
+    // (`N @ N^T = S = H @ P @ H^T + R`) -- this repo's own equivalence test
+    // ("update() matches the plain EKF...") independently confirms it
+    // against a hand-computed `S`. Computed purely for this bookkeeping,
+    // off the hot path -- `update()`'s own math never needs `S` itself,
+    // the entire point of the square-root technique.
+    const RecoverS = maryam.Equation("N @ N^T", struct { N: GainN });
 
     return struct {
         const Self = @This();
@@ -94,9 +123,58 @@ pub fn SquareRootKalmanFilter(comptime n: usize, comptime k: usize, comptime m: 
         Q: Core.StateMat, // (n x n) Process noise
         R: Core.MeasureNoise, // (m x m) Measurement noise
 
+        // Recorded by the most recent update() -- see kalman.zig's
+        // `last_K`/`last_y`/`last_S` fields for why this exists on every
+        // filter variant (generic wrappers like `adaptive_kalman.AdaptiveKalmanFilter`).
+        // `last_K` is the *effective* gain `K @ N^-1` (see `EffectiveGain`
+        // above), not the raw QR-block `K` used internally -- it's the one
+        // that actually satisfies `dx = last_K @ last_y`. `last_S` is
+        // recovered from `N` (see `RecoverS` above), not computed directly.
+        last_K: Core.GainMat = undefined,
+        last_y: Core.MeasureVec = undefined,
+        last_S: Core.MeasureNoise = undefined,
+
         pub fn predict(self: *Self, u: ControlVec) maryam.EvalError!void {
             const F = Model.jacobianF(self.x, u);
             self.x = Model.f(self.x, u);
+
+            // Genuine QR-based square-root predict, taken whenever Q has a
+            // Cholesky factor Q1_2 (Q1_2 @ Q1_2^T = Q) -- P' = F@P@F^T + Q =
+            // (F@L)(F@L)^T + Q1_2@Q1_2^T = A^T @ A for A = [(F@L)^T; Q1_2^T]
+            // stacked into a 2n x n matrix. QR-decomposing A (A = Qq @ R)
+            // gives A^T @ A = R^T @ R (Qq is orthogonal), and since R is
+            // upper-triangular with its bottom n rows all zero, that reduces
+            // to U^T @ U for U, R's top n x n block -- so L' = U^T (lower
+            // triangular) is a valid square root of P', without ever
+            // reconstructing P' itself. Every process noise this repo's own
+            // models build (`ctrv.processNoise`, `gps_ins.processNoise`) is
+            // rank-deficient by construction (see the module doc comment),
+            // so they always fall through to the reconstruction path below
+            // -- this path is for callers whose Q is genuinely full-rank.
+            if (maryam.operation.choleskyMatrix(Core.StateMat, self.Q)) |q1_2| {
+                const fl = FL.eval(.{ .F = F, .L = self.L });
+
+                var a = PredictAugmented.zero();
+                for (0..n) |i| for (0..n) |j| {
+                    a.data[i][j] = fl.data[j][i]; // top n x n: (F @ L)^T
+                    a.data[n + i][j] = q1_2.data[j][i]; // bottom n x n: Q1_2^T
+                };
+
+                const qr = maryam.operation.qrMatrix(PredictAugmented, a) orelse return error.RankDeficient;
+
+                var l_new: Core.StateMat = undefined; // L' = U^T, U = qr.r[0:n, 0:n]
+                for (0..n) |i| for (0..n) |j| {
+                    l_new.data[i][j] = qr.r.data[j][i];
+                };
+                self.L = l_new;
+                return;
+            }
+
+            // Fallback: Q isn't (detectably) positive-definite, so there's
+            // no Q1_2 to build the QR path above. Reconstructs P, runs the
+            // ordinary Joseph-form recursion, and re-factors the result back
+            // into L -- which validates every predicted P is genuinely SPD
+            // as a side effect, or fails fast with NotPositiveDefinite.
             const P = ReformP.eval(.{ .L = self.L });
             const P_pred = Core.PredictP.eval(.{ .F = F, .P = P, .Q = self.Q });
             self.L = maryam.operation.choleskyMatrix(Core.StateMat, P_pred) orelse return error.NotPositiveDefinite;
@@ -139,6 +217,9 @@ pub fn SquareRootKalmanFilter(comptime n: usize, comptime k: usize, comptime m: 
             const y = residual(z, Model.h(self.x));
             self.x = try ApplyGain.eval(.{ .x = self.x, .K = K, .N = N, .y = y });
             self.L = L_new;
+            self.last_K = try EffectiveGain.eval(.{ .K = K, .N = N });
+            self.last_y = y;
+            self.last_S = RecoverS.eval(.{ .N = N });
         }
     };
 }
@@ -337,6 +418,107 @@ test "update() matches the plain EKF on a genuinely multi-dimensional measuremen
     // two state components.
     try std.testing.expectApproxEqAbs(@as(f64, 0), P.data[0][1], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0), P.data[1][0], 1e-9);
+
+    // last_S (recovered from N -- see the module doc comment and RecoverS's
+    // own comment) should match this test's independently hand-computed
+    // S = diag(5, 13), confirming N @ N^T = S actually holds here and isn't
+    // just assumed.
+    try std.testing.expectApproxEqAbs(@as(f64, 5), filter.last_S.data[0][0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 13), filter.last_S.data[1][1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), filter.last_S.data[0][1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), filter.last_S.data[1][0], 1e-9);
+}
+
+test "predict() takes the genuine QR-based path when Q is positive-definite, matching Joseph form" {
+    // Every Q built by this repo's own models (ctrv/gps_ins) is
+    // rank-deficient by construction, so predict()'s QR path (see the
+    // module doc comment) never actually runs in the benchmarks -- this
+    // uses a plain positive-definite Q to exercise it directly, and checks
+    // the result against the ordinary (non-square-root) Joseph-form
+    // recursion computed independently.
+    const Vec2 = maryam.MatrixType(2, 1);
+    const Mat2 = maryam.MatrixType(2, 2);
+
+    const vec = struct {
+        fn of(a: f64, b: f64) Vec2 {
+            var v = Vec2.zero();
+            v.data[0][0] = a;
+            v.data[1][0] = b;
+            return v;
+        }
+    }.of;
+    const diag = struct {
+        fn of(a: f64, b: f64) Mat2 {
+            var mtx = Mat2.zero();
+            mtx.data[0][0] = a;
+            mtx.data[1][1] = b;
+            return mtx;
+        }
+    }.of;
+
+    const Model = struct {
+        fn f(x: Vec2, u: Vec2) Vec2 {
+            _ = u;
+            return x;
+        }
+        fn jacobianF(x: Vec2, u: Vec2) Mat2 {
+            _ = x;
+            _ = u;
+            return diag(1, 1);
+        }
+        fn h(x: Vec2) Vec2 {
+            return x;
+        }
+        fn jacobianH(x: Vec2) Mat2 {
+            _ = x;
+            return diag(1, 1);
+        }
+    };
+
+    const SRKF = SquareRootKalmanFilter(2, 2, 2, Model);
+    var filter = SRKF{
+        .x = vec(0, 0),
+        .L = diag(2, 3), // P0 = diag(4, 9)
+        .Q = diag(0.5, 0.25), // positive-definite: Cholesky succeeds, QR path taken
+        .R = diag(1, 4),
+    };
+
+    try filter.predict(vec(0, 0));
+
+    // F=I: P' = P0 + Q = diag(4.5, 9.25) -- independently expected value,
+    // not re-derived from the implementation's own arithmetic.
+    const p_pred = maryam.operation.mulMatrix(Mat2, Mat2, filter.L, maryam.operation.transposeMatrix(Mat2, filter.L));
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), p_pred.data[0][0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 9.25), p_pred.data[1][1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), p_pred.data[0][1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), p_pred.data[1][0], 1e-9);
+
+    // update() against the plain linear KalmanFilter, run through the exact
+    // same predict+update numbers via ordinary Joseph-form math, should
+    // match to the same precision every other SR-KF/EKF-equivalence test in
+    // this file checks.
+    const KF = kalman.KalmanFilter(2, 2, 2);
+    const ControlMat = maryam.MatrixType(2, 2);
+    var ekf = KF{
+        .x = vec(0, 0),
+        .P = diag(4, 9),
+        .F = diag(1, 1),
+        .B = ControlMat.zero(),
+        .Q = diag(0.5, 0.25),
+        .H = diag(1, 1),
+        .R = diag(1, 4),
+    };
+    ekf.predict(vec(0, 0));
+    const z = vec(2.0, -1.0);
+    try ekf.update(z);
+
+    try filter.update(z);
+    try std.testing.expectApproxEqAbs(ekf.x.data[0][0], filter.x.data[0][0], 1e-9);
+    try std.testing.expectApproxEqAbs(ekf.x.data[1][0], filter.x.data[1][0], 1e-9);
+
+    const p_final = maryam.operation.mulMatrix(Mat2, Mat2, filter.L, maryam.operation.transposeMatrix(Mat2, filter.L));
+    try std.testing.expectApproxEqAbs(ekf.P.data[0][0], p_final.data[0][0], 1e-9);
+    try std.testing.expectApproxEqAbs(ekf.P.data[1][1], p_final.data[1][1], 1e-9);
 }
 
 // The tests above only prove SR-KF matches the plain (Joseph-form) filter

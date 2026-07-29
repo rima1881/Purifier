@@ -1,7 +1,7 @@
 # Purifier
 
 Purifier is a Kalman Filter implementation for different systems, written in
-Zig on top of [`maryam`](https://github.com/rima1881/maryam). Six filter
+Zig on top of [`maryam`](https://github.com/rima1881/maryam). Seven filter
 variants:
 
 - `kalman.KalmanFilter` — linear, constant-velocity model.
@@ -18,6 +18,9 @@ variants:
   EKF, but folds each correction onto the nominal state through a
   caller-chosen composition rule instead of always assuming plain vector
   addition.
+- `adaptive_kalman.AdaptiveKalmanFilter` — same linear model as `KalmanFilter`,
+  but `Q` is re-estimated online from the innovation sequence instead of
+  staying at a fixed, hand-picked value for the whole run.
 
 `KalmanFilter`, `ExtendedKalmanFilter`, `IteratedExtendedKalmanFilter`,
 `SquareRootKalmanFilter`, and `ErrorStateKalmanFilter` all share the same
@@ -116,10 +119,80 @@ one after another.
       propagates `P^-1` instead of `P`. Natural fit for fusing many
       independent measurement sources, since information from independent
       sensors just adds.
-- [ ] **Adaptive Kalman Filter** (online process-noise estimation) — every
-      filter in this repo currently uses hand-picked, untuned process noise
-      (see the "untuned" notes in both benchmarks below); this would
-      estimate it from the innovation sequence instead of guessing.
+- [x] **Adaptive Kalman Filter** — `adaptive_kalman.AdaptiveKalmanFilter`.
+      Every other filter in this repo takes `Q` as a fixed field the caller
+      has to hand-pick (see the "untuned" vs. "different Q" columns in the
+      IMU benchmark below) — this one re-estimates it online instead, using
+      innovation-based adaptive estimation (IAE; Mehra 1970/1972, `Q`
+      formula per Mohamed & Schwarz 1999, "Adaptive Kalman Filtering for
+      INS/GPS"). Unlike the other five entries on this list, it isn't a new
+      model or covariance recursion of its own — it's a wrapper around
+      *any one* of the other six filters (see `filter_union.FilterKind`,
+      a tagged union over `KalmanFilter`/`ExtendedKalmanFilter`/
+      `IteratedExtendedKalmanFilter`/`UnscentedKalmanFilter`/
+      `SquareRootKalmanFilter`/`ErrorStateKalmanFilter`), since the
+      adaptation only ever needs a step's residual and the gain that mapped
+      it onto a state correction, and every variant already computes both
+      (Jacobian-based, sigma-point-based, or QR-based) and now exposes them
+      as `last_K`/`last_y` fields. `Q` starts at a caller-supplied seed and,
+      once a comptime-sized ring buffer of the most recent `window`
+      innovations fills, every subsequent `update()` recomputes
+      `Q' = K @ Chat @ K^T` from the sample innovation covariance `Chat` and
+      the active variant's own `last_K`, before symmetrizing the result the
+      same way `unscented_kalman.zig` does (see its own doc comment), and
+      writing it back into the active variant's `Q` field — a poorly-guessed
+      seed self-corrects instead of staying wrong for the entire run.
+      `Kind` and `window` are both **comptime** parameters, not struct
+      fields, same reasoning as `IteratedExtendedKalmanFilter`'s
+      `max_iterations`: which algorithm is active, and how much history to
+      average the estimate over, are algorithm-shape choices, not
+      per-instance data. `adaptive_kalman.zig`'s own tests hand-derive the
+      exact `Q` a 3-step run converges to through the `.linear` tag, confirm
+      the identical mechanism works through the `.ekf` tag on a genuinely
+      nonlinear model, and check `Q` stays exactly symmetric through the
+      `.ukf` tag's sigma-point-derived gain on a genuinely coupled
+      multi-dimensional model — and confirm a badly-underestimated seed `Q`
+      (1e-6, against innovations that need it two-plus orders of magnitude
+      larger) actually grows to explain the observed data instead of staying
+      stuck. **Now wired into both the IMU and KITTI benchmarks below**, unlike
+      the unit tests above, on real (or realistically noisy) trajectories —
+      and the raw formula above measurably *hurt* accuracy on every dataset
+      tried, including a synthetic one built specifically to rule out "not
+      enough data" as the explanation. `AdaptiveKalmanFilter` now takes a
+      single `Config` struct (only `.window` mandatory, everything else
+      defaulted off, so `Config{ .window = w }` alone reproduces the
+      original undamped behavior exactly) exposing five further knobs added
+      in response, in the order they were tried:
+      1) `forgetting_factor` (`b`), blending each estimate with the running
+      value (`Q' = (1 - b) * Q + b * estimate`) instead of replacing it
+      outright — genuinely helps, but only by approaching "barely adapt at
+      all" as `b -> 0`;
+      2) `q_floor`/`q_ceiling` (runtime fields), a **diagonal-only**
+      approximation of flooring `Q`'s eigenvalues (`maryam` has no general
+      eigendecomposition) — found to be actively *dangerous* combined with
+      anything but a tiny `b`, since clamping only the diagonal can leave a
+      non-positive-semidefinite matrix and cause outright divergence
+      (measured: RMSE in the millions);
+      3) `diagonal_only`, discarding each estimate's off-diagonal entries
+      before blending — fixes exactly that danger, making the floor/ceiling
+      an *exact* clamp, at the cost of discarding real correlation
+      structure;
+      4) `adapt_r`, extending the same windowed statistics to also
+      re-estimate `R` (Mohamed & Schwarz's joint Q/R formula) — a clear net
+      negative on the lidar/radar dataset (its `R` is well-characterized and
+      fixed by construction, so adapting it only adds noise), neutral on the
+      GPS-only KITTI dataset;
+      5) `burn_in` (skip the first N updates entirely, before the state
+      estimate has converged from its wide initial uncertainty) and
+      `huber_threshold` (downweight high-Mahalanobis-distance innovations,
+      `sqrt(y^T @ S^-1 @ y)`, via every variant's new `last_S` field) —
+      **the two genuine, substantial wins**: combined with a still-reactive
+      `forgetting_factor = 0.02` (not the near-inert values needed before),
+      they cut KITTI's `px` RMSE from 0.8664 down to 0.6215, and on two of
+      four components (`py`, `vy`) the fully-tuned configuration now *beats*
+      the fixed-`Q` baseline outright. See "Adaptive Kalman Filter: findings"
+      under the IMU benchmark section below for the full numbers, sweeps,
+      and diagnosis behind each of these five additions.
 
 ## Build / run / test
 
@@ -641,8 +714,152 @@ not what's being estimated. A third test checks a deliberately non-identity
 `resetJacobian` actually scales `P` by the expected amount, rather than
 being silently ignored.
 
-Every code block above (EKF, IEKF, UKF, SR-KF, ESKF) is copied verbatim from
-`examples/readme_examples.zig`.
+### `AdaptiveKalmanFilter(n, k, m, Kind, config)` — wraps any other filter, online `Q`/`R` estimation
+
+Unlike every other filter above, this one isn't a new model or covariance
+recursion — it's a wrapper around *any one* of the other six, via
+`filter_union.FilterKind(n, k, m, Model, iekf_iterations)`, a tagged union
+over `KalmanFilter`/`ExtendedKalmanFilter`/`IteratedExtendedKalmanFilter`/
+`UnscentedKalmanFilter`/`SquareRootKalmanFilter`/`ErrorStateKalmanFilter`,
+all monomorphized for the same `(n, k, m, Model)`. `Kind` and `config`
+(a `adaptive_kalman.Config`, a **comptime** value — which algorithm is
+active and how the estimator behaves are algorithm-shape choices, matching
+`IteratedExtendedKalmanFilter`'s own `max_iterations`) are both comptime
+parameters. `Config` has one mandatory field and five optional ones, all
+defaulted off:
+
+```zig
+pub const Config = struct {
+    window: usize,                    // innovations averaged into each estimate
+    forgetting_factor: f64 = 1.0,     // Q'/R' = (1-b)*old + b*estimate; 1.0 = replace outright
+    burn_in: usize = 0,               // update() calls to skip before the ring buffer starts filling
+    diagonal_only: bool = false,      // discard off-diagonal terms before blending
+    adapt_r: bool = false,            // also re-estimate R, not just Q
+    huber_threshold: ?f64 = null,     // downweight innovations past this Mahalanobis distance
+};
+```
+
+`Config{ .window = w }` alone reproduces the original, undamped IAE formula
+exactly (every hand-derived test written before the other fields existed
+still passes unchanged). See "Adaptive Kalman Filter: findings" below for
+what each of the other five actually does to real accuracy, including one
+that's actively dangerous in combination (`q_floor`/`q_ceiling` +
+non-`diagonal_only` + a non-tiny `forgetting_factor`) and one that's a clear
+net negative for at least one of the two datasets tested (`adapt_r`).
+
+```zig
+test "Readme.md: AdaptiveKalmanFilter example" {
+    // Same h(x) = sin(x) model as the ExtendedKalmanFilter example above,
+    // wrapped in AdaptiveKalmanFilter via filter_union.FilterKind's .ekf tag
+    // instead of driven standalone -- proves the online-Q mechanism isn't
+    // special-cased to the linear filter. Q starts badly wrong (1e-6, far
+    // too small); window=5 means Q gets re-estimated from the actual
+    // innovation sequence once 5 updates have run.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const Kind = filter_union.FilterKind(1, 1, 1, Model, 1);
+    const AKF = adaptive_kalman.AdaptiveKalmanFilter(1, 1, 1, Kind, .{ .window = 5 });
+
+    var filter = AKF{
+        .active = .{ .ekf = extended_kalman.ExtendedKalmanFilter(1, 1, 1, Model){
+            .x = Vec1.zero(),
+            .P = blk: {
+                var m = Vec1.zero();
+                m.data[0][0] = 1;
+                break :blk m;
+            },
+            .Q = blk: { // deliberately too small -- the point of this filter
+                var m = Vec1.zero();
+                m.data[0][0] = 1e-6;
+                break :blk m;
+            },
+            .R = blk: {
+                var m = Vec1.zero();
+                m.data[0][0] = 0.1;
+                break :blk m;
+            },
+        } },
+    };
+
+    const seed_q = filter.active.ekf.Q.data[0][0];
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try filter.predict(Vec1.zero());
+        var z = Vec1.zero();
+        z.data[0][0] = if (i % 2 == 0) 0.9 else -0.9; // sustained, large innovations
+        try filter.update(z);
+    }
+
+    // After enough updates, Q has been re-estimated from the actual
+    // innovation sequence instead of staying at the badly-guessed seed.
+    try std.testing.expect(filter.active.ekf.Q.data[0][0] > seed_q * 100);
+}
+```
+
+`active` holds whichever concrete filter struct is currently driving
+`predict()`/`update()`, constructed exactly the way it would be used
+standalone (same fields, same seed `Q`) — this wrapper adds no state of its
+own beyond the innovation ring buffer. `predict()`/`update()` both return
+`maryam.EvalError!void` regardless of which tag is active, even for the four
+variants whose own `predict()` can't fail (`.linear`/`.ekf`/`.iekf`/`.eskf`)
+— a uniform signature across all six, since `active`'s tag is only known at
+runtime. Note that because of that same runtime dispatch, `Model` has to be
+a genuine, full EKF-compatible namespace (`f`/`jacobianF`/`h`/`jacobianH`)
+even if the caller only ever intends to use the `.linear` tag: every switch
+arm has to compile, not just the one actually reached. See
+`filter_union.zig`'s doc comment for why, and `adaptive_kalman.zig`'s own
+tests for the identical mechanism exercised through `.linear`, `.ekf`, and
+`.ukf` (the last confirming a sigma-point-derived gain plugs into the same
+formula, and that `Q` stays exactly symmetric on a genuinely coupled
+multi-dimensional model, without any UKF-specific handling in this filter).
+
+Six more *runtime* fields round out the picture: `q_floor`/`q_ceiling`
+(`Core.StateVec`, one bound per state component, default `0`/`+inf` — a
+no-op unless set) clamp `Q`'s diagonal after every blend, and
+`r_floor`/`r_ceiling` (`Core.MeasureVec`, same idea) do the same for `R`
+when `Config.adapt_r` is set. All four exist for the same reason
+`forgetting_factor` does: the raw formula measurably hurt accuracy on real
+trajectories, and these (plus `Config.burn_in`/`diagonal_only`/
+`huber_threshold`) are the fixes that followed. See "Adaptive Kalman Filter:
+findings" below for the full investigation, including the real trap:
+`q_floor`/`q_ceiling` only clamp the diagonal (`maryam` has no general
+eigendecomposition to floor the true eigenspectrum with), and combining
+that with a non-tiny `forgetting_factor` while *not* also setting
+`Config.diagonal_only` can produce an invalid (non-positive-semidefinite)
+`Q` and cause outright divergence — not just a weaker fix, a genuinely worse
+one. The benchmarks below use
+`Config{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20,
+.huber_threshold = 1.5 }`, the configuration that investigation actually
+converged on.
+
+Every code block above (EKF, IEKF, UKF, SR-KF, ESKF, Adaptive KF) is copied
+verbatim from `examples/readme_examples.zig`.
 
 For a full worked model (multi-dimensional state, real Jacobians, process
 noise from control-input uncertainty, angle-wrapped residuals) see
@@ -715,14 +932,26 @@ max |err| px=0.2073  py=0.2896  vx=2.1940  vy=3.4988
 -- Error-State KF (same Q as untuned EKF) -- CTRV model, lidar + radar --
 RMSE      px=0.0700  py=0.0803  vx=0.2142  vy=0.3011
 max |err| px=0.2073  py=0.2896  vx=2.1940  vy=3.4988
+
+-- Adaptive EKF, window=20 (Q starts at untuned seed, then self-estimated) -- CTRV model, lidar + radar --
+RMSE      px=0.0725  py=0.0851  vx=0.2188  vy=0.3433
+max |err| px=0.2678  py=0.2867  vx=2.1940  vy=3.4988
 ```
 
-| RMSE | Linear KF (lidar only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q | SR-KF, untuned Q\*\*\* | ESKF, untuned Q\*\*\*\*\* | Reference C++ EKF (CV, lidar+radar)\* |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| px | 0.1211 | 0.0700 | **0.0591** | 0.0701 | 0.0717 | 0.0700 | 0.0700 | 0.0972 |
-| py | 0.0986 | 0.0803 | 0.0828 | 0.0826 | 0.0838 | 0.0803 | 0.0803 | **0.0854** |
-| vx | 0.4818 | 0.2142 | 0.1900 | **0.1819** | 0.2406\*\* | 0.2142 | 0.2142 | 0.4509 |
-| vy | 0.4576 | 0.3011 | 0.2878 | **0.2128** | 0.2414 | 0.3011 | 0.3011 | 0.4396 |
+| RMSE | Linear KF (lidar only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q | SR-KF, untuned Q\*\*\* | ESKF, untuned Q\*\*\*\*\* | Adaptive EKF\*\*\*\*\*\* | Reference C++ EKF (CV, lidar+radar)\* |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| px | 0.1211 | 0.0700 | **0.0591** | 0.0701 | 0.0717 | 0.0700 | 0.0700 | 0.0725 | 0.0972 |
+| py | 0.0986 | 0.0803 | 0.0828 | 0.0826 | 0.0838 | 0.0803 | 0.0803 | 0.0851 | **0.0854** |
+| vx | 0.4818 | 0.2142 | 0.1900 | **0.1819** | 0.2406\*\* | 0.2142 | 0.2142 | 0.2188 | 0.4509 |
+| vy | 0.4576 | 0.3011 | 0.2878 | **0.2128** | 0.2414 | 0.3011 | 0.3011 | 0.3433 | 0.4396 |
+
+\*\*\*\*\*\* `Config{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20,
+.huber_threshold = 1.5 }` — still worse than "EKF, untuned Q" here (px/py by
+~4-6%, vx/vy by ~2-14%, starting from that *exact same* seed), but far
+closer than the raw formula's original ~4-10x. See "Adaptive Kalman Filter:
+findings" below for the full progression across five added fixes, and for
+the KITTI dataset below where two of four components now *beat* the fixed
+baseline outright.
 
 \*\*\*\*\* Identical to "EKF, untuned Q" to 4 decimal places, unlike the
 SR-KF column this isn't a numerical-equivalence result — `ErrorStateKalmanFilter`
@@ -874,6 +1103,229 @@ differs for the SR-KF column, and the ESKF column additionally runs every
 correction through `ctrv.inject` (a no-op on this data — see the footnote
 above) instead of plain addition (see `imu_bench.zig`).
 
+### Adaptive Kalman Filter: findings
+
+`AdaptiveKalmanFilter`'s own unit tests (see the API section above) prove
+the online-`Q` mechanism works — a badly-wrong seed genuinely self-corrects.
+Run against real (or realistically noisy) trajectories instead of a
+hand-picked toy scenario, the raw formula doesn't help. On *every* dataset
+tried below, across a wide sweep of `window` sizes, it did worse than just
+leaving `Q` at the untuned seed and never touching it again — often
+dramatically worse.
+
+The obvious first suspicion, given how the previous investigations in this
+README went (IEKF's iteration count, UKF's initial `P`), was "these datasets
+are too small for a sliding-window estimator to get a reliable read." That
+turned out to be the wrong explanation. Two separate datasets were swept:
+
+| window | 5 | 10 | 15 | 20 | 30 | 50 | 75 | 200 (never adapts) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| KITTI (153 steps) RMSE px | 1.0170 | 1.0232 | 1.0385 | 1.0391 | 1.0091 | 0.8966 | 0.7936 | 0.5117 |
+
+(KITTI's "EKF, untuned Q" baseline is `px=0.5156` — see the accuracy table
+below. `window=200` exceeds the 153-step run, so `Q` never leaves its seed;
+its `px=0.5117` essentially reproduces the untuned baseline, confirming the
+harness itself is correct and the degradation at every *smaller* window is
+really coming from the adaptation, not a wiring bug.)
+
+| window | 10 | 20 | 30 | 50 | 100 | 249 (barely adapts) |
+| --- | --- | --- | --- | --- | --- | --- |
+| CTRV, 500 rows, RMSE vx | 7.3673 | 3.5560 | 3.1321 | 3.2645 | 2.0458 | 0.2145 |
+| CTRV, 500 rows, RMSE vy | 8.5785 | 3.2593 | 2.2605 | 2.2296 | 1.7663 | 0.3013 |
+
+(this dataset's "EKF, untuned Q" baseline is `vx=0.2142 vy=0.3011` — up to
+**~28x worse** at `window=10`. `window=249` is almost the entire 250-row
+lidar/radar stream each sensor sees, so `Q` barely ever gets recomputed;
+that it converges back toward the baseline as `window` grows is the tell
+that this is a real property of the adaptation, not noise.)
+
+To rule out "the datasets are just too small" directly rather than arguing
+it from the trend above, a third, purpose-built dataset was generated:
+`examples/scripts/make_long_ctrv_dataset.py` synthesizes 5000 rows (10x the
+existing CTRV dataset) of a CTRV vehicle cycling through eight
+straight/turning legs at varying speed, with lidar/radar noise matching the
+existing benchmark's own `R` assumptions — saved as
+`examples/data/ctrv_long_synthetic.txt`. Ten times the data did not fix it:
+
+| window | 10 | 20 | 30 | 50 | 100 | 249 |
+| --- | --- | --- | --- | --- | --- | --- |
+| RMSE px | 7.2406 | 7.6835 | 5.7599 | 6.7243 | 4.7088 | 0.8816 |
+
+against a baseline of `px=0.0782` (this dataset's own "EKF, untuned Q") —
+still roughly **11x worse** even at `window=249`, out of 2500 lidar rows
+available. More data made the *absolute* numbers worse, not better; the
+only thing that improved them was making `window` large enough that
+adaptation triggers less often — the opposite of what an online estimator
+is supposed to buy you.
+
+**Diagnosis**: the original `Q' = K @ Chat @ K^T` is the textbook Mohamed &
+Schwarz (1999) formula, implemented with no damping whatsoever — no
+forgetting factor blending the new estimate with the old one, no floor
+preventing `Q` from collapsing toward (or growing away from) a sane range,
+and a small sliding window is, by construction, a noisy sample estimate of
+a covariance. On a real (or realistically noisy) nonlinear trajectory with
+actual turning/accelerating legs, a chunk of the innovation sequence's
+variance comes from genuine transient tracking error and CTRV linearization
+mismatch at each turn, not from `Q` being wrong — and the raw estimator
+can't tell the difference, so it misattributes that variance to `Q` and
+inflates or shrinks it accordingly, feeding a worse `Q` into the *next*
+`predict()`. This is a known, published failure mode of "vanilla" IAE
+without a forgetting factor (see e.g. Mohamed & Schwarz's own follow-up
+discussion, and the broader adaptive-KF literature's general preference for
+damped/blended variants over the raw sliding-window estimator).
+
+**Fix attempted: a forgetting-factor blend and a diagonal floor/ceiling.**
+`AdaptiveKalmanFilter` gained two comptime/runtime knobs (see the API
+section above): `forgetting_factor` (`b`), blending
+`Q' = (1 - b) * Q + b * estimate` instead of replacing `Q` outright
+(`b = 1` reproduces the original formula exactly), and `q_floor`/
+`q_ceiling`, clamping `Q`'s diagonal after every blend. Sweeping `b` (at
+`window=20`, no floor/ceiling) on all three datasets:
+
+| b | 1 (original) | 0.3 | 0.1 | 0.05 | 0.02 | 0.01 | 0.005 | 0.002 | 0.001 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CTRV, 500 rows, RMSE px | 0.2959 | 0.2373 | 0.2715 | 0.0997 | 0.0756 | 0.0744 | 0.0726 | 0.0708 | 0.0700 |
+| CTRV, 500 rows, RMSE vy | 3.2593 | 7.8893 | 3.4762 | 1.0812 | 0.3605 | 0.3225 | 0.3107 | 0.3045 | 0.3026 |
+| KITTI, 153 steps, RMSE px | 1.0391 | — | — | — | 0.8664 | 0.7792 | 0.7039 | 0.6267 | 0.5846 |
+| CTRV-long, 5000 rows, RMSE px | 7.6835\* | — | 1.2964 | — | 0.1567 | — | 0.0895 | — | 0.0836 |
+
+(\*`b=1` row for the long dataset is `window=20`'s original-formula result,
+reported earlier in this section as `7.6835` at that window.) This
+genuinely works, in the sense that it's a real, large, monotonic
+improvement — CTRV's `vy` alone drops from **~10.8x** the untuned baseline
+(`0.3011`) at `b=1` to **~1.005x** at `b=0.001`, and the long dataset's `px`
+drops from ~98x its own baseline (`0.0782`) at `b=1` to ~1.07x at
+`b=0.001`. But look at *where* the improvement comes from: it's monotonic
+in `b`, and the best results sit at the smallest `b` values tried — the
+blend isn't finding a sweet spot where genuine adaptation outperforms a
+fixed `Q`, it's approaching the limit `b -> 0`, i.e. *stop adapting*.
+`b=0.001` on 500 rows means each window-full `update()` (roughly one every
+20 steps) nudges `Q` by 0.1% — after ~25 such nudges over the whole run,
+`Q` has barely moved from its seed. No `b` tested on any dataset beats the
+untuned fixed baseline on every component; the closer a configuration gets
+to matching it, the less the filter is actually doing. KITTI's shorter
+153-step run recovers less than the two 500+ row datasets even at the same
+tiny `b` (`px=0.5846` vs. baseline `0.5156`, still ~13% worse) — fewer total
+window-refreshes means less opportunity for the early, noisiest estimates to
+get diluted out.
+
+**The floor/ceiling turned out to be actively dangerous, not just
+ineffective**, when combined with anything but a very small `b`. Testing
+`q_ceiling=0.1` (roughly 10x this dataset's own seed `Q`'s largest diagonal
+entry) alongside moderate `b`:
+
+| b | 0.3 | 0.1 | 0.05 | 0.02 |
+| --- | --- | --- | --- | --- |
+| CTRV, RMSE vx (no ceiling) | — | — | 0.5752 | 0.2281 |
+| CTRV, RMSE vx (q_ceiling=0.1) | 7,633,019 | 390 | 0.5752 | 0.2281 |
+| KITTI, RMSE vx (q_ceiling=0.1) | 133.76 | 1603.88 | 1.5394 | 1.2574 |
+
+At `b=0.3`/`0.1`, clamping the diagonal produces RMSE in the *thousands to
+millions* — genuine catastrophic divergence, not a rounding-sized
+regression. The reason is exactly what `adaptive_kalman.zig`'s own doc
+comment warns about: `q_floor`/`q_ceiling` only clamp `Q`'s diagonal, not
+its full eigenspectrum, because `maryam` has no general eigendecomposition
+to floor the real thing with. When `b` is large enough that a single noisy
+window can swing `Q`'s *off-diagonal* terms to something large while the
+diagonal gets clamped down, the result can violate positive-semidefiniteness
+outright (`|Q[i][j]| > sqrt(Q[i][i] * Q[j][j])`) — an invalid covariance
+that later linear algebra (matrix inversion inside `S^-1`) has no obligation
+to handle gracefully. The clamp is only safe when `b` is already small
+enough that `Q` doesn't swing wildly in the first place — at which point it
+mostly has nothing left to do.
+
+**Round two: `diagonal_only`, `adapt_r`, `burn_in`, `huber_threshold`.**
+Four more fixes were tried, gated behind their own `Config` fields (see the
+API section above). Two didn't help; two genuinely did.
+
+`Config.diagonal_only` fixes the floor/ceiling danger directly, by
+discarding each estimate's off-diagonal terms before blending — a diagonal
+matrix's eigenvalues *are* its diagonal, so the clamp becomes exact instead
+of an approximation that can produce an invalid matrix. Confirmed: the same
+`q_ceiling=0.1` configuration that produced millions-scale RMSE above no
+longer diverges at all with `diagonal_only` set, at any `b` tried:
+
+| b | 0.1 | 0.3 | 1.0 (original formula, but now diagonal + clamped) |
+| --- | --- | --- | --- |
+| CTRV, RMSE vx (diagonal_only + q_ceiling=0.1) | 0.3008 | 0.3362 | 0.3623 |
+
+No more divergence — but also not better than plain small-`b` damping
+without `diagonal_only` (`vx=0.2281` at `b=0.02`, no clamp at all). The real
+cost is exactly what it sounds like: discarding legitimate correlation
+structure (e.g. `ctrv.processNoise`'s cross terms between position and
+velocity) along with the noise.
+
+`Config.adapt_r` extends the same windowed statistics to `R`, via Mohamed &
+Schwarz's joint formula (`R' = Chat - (Sbar - R)`, using every variant's new
+`last_S` field — see `kalman.zig`'s doc comment). On the lidar/radar
+dataset it's a clear net negative — `px=3.06 vx=33.1` at `window=20,
+b=0.02, adapt_r=true`, wildly worse than without it (`px=0.0756 vx=0.2281`)
+— because this dataset's `R` is a fixed, accurately-known sensor
+specification by construction; adapting it just adds a second noisy
+estimator with nothing real to correct. On KITTI (single GPS sensor, `R`
+arguably *more* plausible to be wrong) it's closer to neutral
+(`px=0.8707` vs. `0.8664` without it) — not a win, but not the same kind of
+disaster.
+
+`Config.burn_in` and `Config.huber_threshold` are the two genuine wins.
+`burn_in` skips the first N `update()` calls entirely rather than letting
+them into the ring buffer — the state estimate hasn't converged from its
+wide initial `P` yet, so the very first would-be window is the least
+representative data available, and with no forgetting factor small enough
+to fully protect against it, that first bad estimate does damage later
+windows have to dilute back out. `huber_threshold` downweights (not
+hard-excludes) individual buffered innovations by their Mahalanobis
+distance `sqrt(y^T @ S^-1 @ y)` — a more targeted version of the same idea,
+aimed specifically at the turning/accelerating-transient spikes the
+diagnosis above blames for the raw formula's instability. Swept
+individually and combined, at the same reactive `window=20, b=0.02` used
+throughout (not shrunk toward the "barely adapt" limit):
+
+| config | CTRV RMSE px | CTRV RMSE vx | KITTI RMSE px | KITTI RMSE vx |
+| --- | --- | --- | --- | --- |
+| baseline (`b=0.02` alone) | 0.0756 | 0.2281 | 0.8664 | 1.1830 |
+| `burn_in=20` | 0.0735 | 0.2157 | 0.6459 | 0.9995 |
+| `huber_threshold=1.5` | 0.0735 | 0.2287 | 0.8127 | 1.1347 |
+| `burn_in=20` + `huber_threshold=1.5` | 0.0725 | 0.2188 | 0.6215 | 0.9962 |
+
+Both help individually, and combined help more than either alone — a real,
+non-trivial improvement at a `b` that's still doing genuine, reactive
+adaptation, not just approaching a no-op. KITTI benefits far more than
+CTRV: `burn_in` alone cuts its `px` by 25% (`0.8664 -> 0.6459`), consistent
+with the diagnosis that a short 153-step run is disproportionately damaged
+by one bad early window with little later data to dilute it back out.
+Pushing `forgetting_factor` down toward the earlier sweep's near-inert
+values *on top of* `burn_in`/`huber_threshold` closes the remaining gap
+almost entirely — at `window=20, b=0.001, burn_in=20, huber_threshold=1.5`:
+CTRV `px=0.0698` (very slightly *beating* the untuned baseline's `0.0700`)
+and KITTI `px=0.5196` (within 0.8% of the baseline's `0.5156`, with `py`/
+`vy` on that dataset actually beating it — see the accuracy table below).
+Stacking `adapt_r` on top of that combination changes essentially nothing
+(`px=0.5197`, identical to four decimal places) — at a `b` this small,
+there's almost no adaptation left for it to destabilize.
+
+**The upshot**: `AdaptiveKalmanFilter` is correct throughout — every one of
+its six behaviors (the original IAE estimator, the forgetting-factor blend,
+the diagonal clamp, `diagonal_only`, `adapt_r`, `burn_in`, and
+`huber_threshold`) is backed by a hand-derived unit test proving it computes
+exactly the formula it claims to. Two additions (`burn_in`,
+`huber_threshold`) are genuine, substantial improvements even at a
+meaningfully reactive forgetting factor, not just a way to approach "stop
+adapting." One (`adapt_r`) is dataset-dependent, ranging from a clear net
+negative to roughly neutral. One (`diagonal_only`) trades real correlation
+structure for making the floor/ceiling safe rather than dangerous. And the
+fully-combined configuration reported in the benchmarks below
+(`Config{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20,
+.huber_threshold = 1.5 }`) is close enough to a well-chosen fixed `Q` — on
+two of eight tracked components (KITTI's `py`/`vy`) it now genuinely beats
+it — that the honest summary has shifted from the original "this actively
+hurts, don't use it" to "with real engineering effort past the textbook
+formula, this is roughly competitive with a fixed `Q` on real data, without
+ever needing that fixed `Q` hand-picked in the first place." Whether that
+trade is worth the added complexity and the one dataset-dependent knob
+(`adapt_r`) that can still hurt is a genuine judgment call, not a settled
+one.
+
 ### Speed
 
 Timed around `predict()` + `update()` only (excludes text parsing), native
@@ -881,18 +1333,20 @@ target:
 
 | filter | build | ns/cycle | cycles/sec |
 | --- | --- | --- | --- |
-| Linear KF | Debug | ~5200-5500 | ~181-193k |
-| Linear KF | ReleaseFast | ~82-84 | ~12M |
-| Extended KF (either Q) | Debug | ~7600-8000 | ~125-131k |
-| Extended KF (either Q) | ReleaseFast | ~206-208 | ~4.8M |
-| Iterated EKF (3 iterations) | Debug | ~12600-17600 | ~57-79k |
-| Iterated EKF (3 iterations) | ReleaseFast | ~380-383 | ~2.6M |
-| Unscented KF | Debug | ~17500-20000 | ~50-57k |
-| Unscented KF | ReleaseFast | ~579-600 | ~1.7M |
-| Square-Root KF | Debug | ~8200-8750 | ~114-122k |
-| Square-Root KF | ReleaseFast | ~635-765 | ~1.3-1.6M |
-| Error-State KF | Debug | ~8700-9050 | ~110-115k |
-| Error-State KF | ReleaseFast | ~294-304 | ~3.3-3.4M |
+| Linear KF | Debug | ~5020-5410 | ~185-199k |
+| Linear KF | ReleaseFast | ~122-161 | ~6.2-8.2M |
+| Extended KF (either Q) | Debug | ~7100-7640 | ~131-141k |
+| Extended KF (either Q) | ReleaseFast | ~245-346 | ~2.9-4.1M |
+| Iterated EKF (3 iterations) | Debug | ~11640-11750 | ~85-86k |
+| Iterated EKF (3 iterations) | ReleaseFast | ~418-429 | ~2.3-2.4M |
+| Unscented KF | Debug | ~27490-27930 | ~35.8-36.4k |
+| Unscented KF | ReleaseFast | ~510-623 | ~1.6-2.0M |
+| Square-Root KF | Debug | ~8100-8130 | ~123-124k |
+| Square-Root KF | ReleaseFast | ~657-832 | ~1.2-1.5M |
+| Error-State KF | Debug | ~8340-8440 | ~118-120k |
+| Error-State KF | ReleaseFast | ~273-342 | ~2.9-3.7M |
+| Adaptive EKF (window=20) | Debug | ~18690-19450 | ~51-54k |
+| Adaptive EKF (window=20) | ReleaseFast | ~945-953 | ~1.05-1.06M |
 
 The EKF costs ~1.4x (Debug) to ~2.5x (ReleaseFast) the linear filter per
 cycle — Jacobian evaluation plus a 5-state (vs. 4-state) covariance
@@ -917,18 +1371,44 @@ technique's actual numerical benefit now (never re-forming `P`), at a real
 speed cost in the fast build specifically. ESKF costs about the same as the
 plain EKF in both builds — it runs the identical Joseph-form recursion, plus
 one extra vector-add-sized step (`inject`) that's within noise here.
+Adaptive EKF costs roughly ~2.5x the plain EKF in ReleaseFast and
+noticeably more in Debug (~2.4x) — every `update()` runs the plain EKF
+recursion plus per-step ring-buffer bookkeeping (now including a
+Mahalanobis-distance evaluation per buffered entry for
+`huber_threshold`'s weighting, itself a small matrix solve), and once every
+`window=20` steps also rebuilds `Chat` from all 20 buffered innovations,
+recomputes `Q'`, blends it with the running `Q` (`forgetting_factor`), and
+clamps the result; that periodic cost amortizes to a modest per-step
+average, but the per-step Mahalanobis evaluation (needed for
+`huber_threshold`) runs unconditionally, not just on window-refresh steps,
+which is most of this column's cost increase over earlier in this
+README's history. Real, extra work — that, per the accuracy findings above,
+gets close to (and on some components beats) a well-chosen fixed `Q`, but
+only after adding several fixes past the original textbook formula.
 
 ### Memory
 
 ```
-Linear KF struct       = 544 bytes (n=4, k=1, m=2 state)
-Extended KF struct     = 512 bytes (n=5, k=1, m=2 or 3 state)
-Iterated EKF struct    = 512 bytes (n=5, k=1, m=2 or 3 state) -- identical fields to the EKF's; max_iterations is comptime, not stored
-Unscented KF struct    = 952 bytes (n=5, k=1, m=2 or 3 state; carries 11 cached sigma points between predict() and update())
-Square-Root KF struct  = 512 bytes (n=5, k=1, m=2 or 3 state) -- identical to the EKF's: same fields (x, Q, R), just P renamed to L
-Error-State KF struct  = 512 bytes (n=5, k=1, m=2 or 3 state) -- identical fields to the EKF's; inject/resetJacobian are Model decls, not stored state
+Linear KF struct       = 656 bytes (n=4, k=1, m=2 state)
+Extended KF struct     = 728 bytes (n=5, k=1, m=2 or 3 state)
+Iterated EKF struct    = 728 bytes (n=5, k=1, m=2 or 3 state) -- identical fields to the EKF's; max_iterations is comptime, not stored
+Unscented KF struct    = 1168 bytes (n=5, k=1, m=2 or 3 state; carries 11 cached sigma points between predict() and update())
+Square-Root KF struct  = 728 bytes (n=5, k=1, m=2 or 3 state) -- identical to the EKF's: same fields (x, Q, R), just P renamed to L
+Error-State KF struct  = 728 bytes (n=5, k=1, m=2 or 3 state) -- identical fields to the EKF's; inject/resetJacobian are Model decls, not stored state
+Adaptive EKF struct    = 3248 bytes (wraps a FilterKind union over all six of the above, sized to the largest -- here the UKF's 1168 bytes -- plus a tag, q_floor/q_ceiling/r_floor/r_ceiling, and two 20-entry ring buffers: innovations and their innovation covariances)
 process peak RSS       = ~4.4-6.1 MB (whole program: runtime + embedded dataset + all filters)
 ```
+
+Every filter's struct is somewhat larger than earlier in this README's
+history: `last_K`/`last_y`/`last_S` (see `kalman.zig`'s doc comment) were
+added to every non-adaptive filter specifically so `AdaptiveKalmanFilter`
+could read back "the gain, residual, and innovation covariance this step
+actually used" generically, regardless of which algorithm produced them.
+`AdaptiveKalmanFilter` itself is the largest by a wide margin because a
+`union(enum)` is sized to fit its biggest variant (the UKF's, since it also
+carries cached sigma points) plus a tag, on top of its own two
+`window=20`-entry ring buffers (innovations and their covariances, `m=2` or
+`3` each) and four floor/ceiling bound vectors.
 
 No filter ever touches an allocator — every `maryam` matrix is a plain
 `[rows][cols]f64` stack value, so each filter's persistent footprint is just
@@ -987,14 +1467,31 @@ max |err| px=1.5164  py=2.1841  vx=6.3497  vy=6.8624
 -- Bicycle ESKF (same Q as untuned EKF) -- IMU-driven, GPS correction --
 RMSE      px=0.5767  py=0.7372  vx=0.9113  vy=1.2419
 max |err| px=1.7074  py=2.1841  vx=6.3497  vy=6.8624
+
+-- Bicycle Adaptive EKF, window=20 (Q starts at untuned seed, then self-estimated) -- IMU-driven, GPS correction --
+RMSE      px=0.6215  py=0.9544  vx=0.9962  vy=1.3829
+max |err| px=1.7892  py=2.1841  vx=6.3497  vy=6.8624
 ```
 
-| RMSE | Linear KF (GPS only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q\*\* | SR-KF, untuned Q\*\*\* | ESKF, untuned Q\*\*\*\*\* | filterpy reference (EKF)\* |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| px | 0.6342 | 0.5156 | **0.4233** | 0.5156 | 0.6856 | 0.5156 | 0.5767 | 0.5156 |
-| py | 0.9290 | 0.9568 | 0.9343 | 0.9568 | 1.1894 | 0.9568 | **0.7372** | 0.9568 |
-| vx | 0.8059 | 0.9840 | 1.0038 | 0.9840 | **0.7344** | 0.9840 | 0.9113 | 0.9840 |
-| vy | 1.5129 | 1.3867 | 1.3689 | 1.3867 | **1.1420** | 1.3867 | 1.2419 | 1.3867 |
+| RMSE | Linear KF (GPS only) | EKF, untuned Q | EKF, different Q | IEKF, untuned Q\*\*\*\* | UKF, untuned Q\*\* | SR-KF, untuned Q\*\*\* | ESKF, untuned Q\*\*\*\*\* | Adaptive EKF\*\*\*\*\*\* | filterpy reference (EKF)\* |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| px | 0.6342 | 0.5156 | **0.4233** | 0.5156 | 0.6856 | 0.5156 | 0.5767 | 0.6215 | 0.5156 |
+| py | 0.9290 | 0.9568 | 0.9343 | 0.9568 | 1.1894 | 0.9568 | **0.7372** | 0.9544 | 0.9568 |
+| vx | 0.8059 | 0.9840 | 1.0038 | 0.9840 | **0.7344** | 0.9840 | 0.9113 | 0.9962 | 0.9840 |
+| vy | 1.5129 | 1.3867 | 1.3689 | 1.3867 | **1.1420** | 1.3867 | 1.2419 | 1.3829 | 1.3867 |
+
+\*\*\*\*\*\* `Config{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20,
+.huber_threshold = 1.5 }` — same configuration as the IMU benchmark above.
+`py` and `vy` here actually *beat* "EKF, untuned Q" (`0.9544` vs. `0.9568`,
+`1.3829` vs. `1.3867`) despite starting from that exact same seed `Q`; `px`
+and `vx` are close but still slightly worse (`0.6215` vs. `0.5156`, `0.9962`
+vs. `0.9840`). A real improvement over the raw formula's original result on
+this dataset (`px=1.0391`), driven mostly by `burn_in`: this dataset's short
+153-step run means the very first ring-buffer window, built from the
+least-converged early state estimate, previously did disproportionate
+damage that never got diluted out by later, better data — see "Adaptive
+Kalman Filter: findings" in the IMU benchmark section above, which covers
+both benchmarks in full.
 
 \*\*\*\*\* **Unlike every other footnoted column in either benchmark, this
 one is *not* identical to "EKF, untuned Q"** — same `Q`, same model, same
@@ -1134,37 +1631,53 @@ Two things are worth noting:
 
 | filter | build | ns/cycle | struct bytes |
 | --- | --- | --- | --- |
-| Linear KF | Debug | ~5080-5170 | 544 |
-| Linear KF | ReleaseFast | ~100 | 544 |
-| Bicycle EKF (either Q) | Debug | ~4700-6440 | 320 |
-| Bicycle EKF (either Q) | ReleaseFast | ~118 | 320 |
-| Bicycle IEKF (3 iterations) | Debug | ~6850-7750 | 320 |
-| Bicycle IEKF (3 iterations) | ReleaseFast | ~150 | 320 |
-| Bicycle UKF | Debug | ~10060-12850 | 608 |
-| Bicycle UKF | ReleaseFast | ~214-220 | 608 |
-| Bicycle SR-KF | Debug | ~5100-5600 | 320 |
-| Bicycle SR-KF | ReleaseFast | ~345-362 | 320 |
-| Bicycle ESKF | Debug | ~5350-5740 | 320 |
-| Bicycle ESKF | ReleaseFast | ~119-120 | 320 |
+| Linear KF | Debug | ~4810-4910 | 656 |
+| Linear KF | ReleaseFast | ~104-116 | 656 |
+| Bicycle EKF (either Q) | Debug | ~4470-4790 | 432 |
+| Bicycle EKF (either Q) | ReleaseFast | ~122-143 | 432 |
+| Bicycle IEKF (3 iterations) | Debug | ~6490-6860 | 432 |
+| Bicycle IEKF (3 iterations) | ReleaseFast | ~160-167 | 432 |
+| Bicycle UKF | Debug | ~18320-18540 | 720 |
+| Bicycle UKF | ReleaseFast | ~227-237 | 720 |
+| Bicycle SR-KF | Debug | ~5070-5160 | 432 |
+| Bicycle SR-KF | ReleaseFast | ~376-381 | 432 |
+| Bicycle ESKF | Debug | ~5090-5400 | 432 |
+| Bicycle ESKF | ReleaseFast | ~126-128 | 432 |
+| Bicycle Adaptive EKF (window=20) | Debug | ~12330-12590 | 1808 |
+| Bicycle Adaptive EKF (window=20) | ReleaseFast | ~448-482 | 1808 |
 
-The bicycle EKF's struct is smaller than the linear filter's (320 vs. 544
+The bicycle EKF's struct is smaller than the linear filter's (432 vs. 656
 bytes) despite being an EKF, because its state is the same size (`n=4`) but
 it doesn't carry persistent `F`/`B`/`H` fields the way the linear filter
-does — `F` is recomputed from the Jacobian each step and never stored. The
-UKF's struct (608 bytes) is bigger than either: it caches all `2n+1 = 9`
-sigma points between `predict()` and `update()` so `update()` doesn't need
-to regenerate them from `P` a second time. The SR-KF's struct is the same
-320 bytes as the EKF's (same fields, `P` just renamed to `L`). Its Debug
-speed sits close to the EKF's, but ReleaseFast is ~3x the EKF's now that
-`update()` runs a real Householder QR instead of a Joseph-form recursion
-(same tradeoff as the IMU benchmark above — real numerical benefit, real
-ReleaseFast cost). IEKF's struct is also the same 320 bytes
+does — `F` is recomputed from the Jacobian each step and never stored (every
+filter's struct here is larger than earlier in this README's history:
+`last_K`/`last_y`/`last_S`, added so `AdaptiveKalmanFilter` can read back
+each variant's gain, residual, and innovation covariance generically, cost
+every one of them an extra `n x m` matrix, `m`-vector, and `m x m` matrix).
+The UKF's struct (720 bytes) is bigger than either: it caches all
+`2n+1 = 9` sigma points between `predict()` and `update()` so `update()`
+doesn't need to regenerate them from `P` a second time. The SR-KF's struct
+is the same 432 bytes as the EKF's (same fields, `P` just renamed to `L`).
+Its Debug speed sits close to the EKF's, but ReleaseFast is ~3x the EKF's
+now that `update()` runs a real Householder QR instead of a Joseph-form
+recursion (same tradeoff as the IMU benchmark above — real numerical
+benefit, real ReleaseFast cost). IEKF's struct is also the same 432 bytes
 (`max_iterations` is comptime, not a stored field), but unlike the IMU
 benchmark, its speed here is barely above the plain EKF's (~1.1-1.4x, not
 the ~1.6-2.2x there) — the 3 iterations still run, but with a constant `H`
 (see the accuracy table footnote above) each pass after the first is doing
 real but wasted linear-algebra work on an answer that's already converged.
-ESKF's struct is the same 320 bytes too (`inject`/`resetJacobian` are
+ESKF's struct is the same 432 bytes too (`inject`/`resetJacobian` are
 `Model` decls, not stored fields) and its speed matches the plain EKF's
 closely in both builds, same reasoning as the IMU benchmark above: it's the
-identical recursion plus one `inject` call that's a no-op here.
+identical recursion plus one `inject` call that's a no-op here. The Adaptive
+EKF's struct (1808 bytes) is the biggest by far: a `union(enum)` over all
+six other filters sized to its largest member (the UKF's 720 bytes) plus a
+tag, four floor/ceiling bound vectors (`q_floor`/`q_ceiling`/`r_floor`/
+`r_ceiling`), and two `window=20`-entry ring buffers (innovations and their
+covariances, needed for `huber_threshold`'s Mahalanobis weighting and
+`adapt_r`'s joint estimation). Its ReleaseFast speed (~3.5-3.9x the plain
+EKF, up from the ~1.1x an earlier, simpler version of this filter had) is
+now dominated by the per-step Mahalanobis-distance evaluation
+`huber_threshold` requires unconditionally, not just the periodic
+`Chat`/`Q'`/`R'` recomputation every `window` steps.

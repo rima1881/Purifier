@@ -30,6 +30,8 @@ const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
 const error_state_kalman = Purifier.error_state_kalman;
+const filter_union = Purifier.filter_union;
+const adaptive_kalman = Purifier.adaptive_kalman;
 const gps_ins = @import("gps_ins.zig");
 const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
@@ -278,6 +280,144 @@ fn runBicyclePair(comptime Filter: type, io: Io, std_af: f64, std_wu: f64, initi
     return acc.finish(@sizeOf(Filter));
 }
 
+// ---- Adaptive EKF: same bicycle model, but Q is re-estimated online instead of fixed ----
+
+// `runBicyclePair` above reconstructs a fresh filter value every row (only
+// `x`/`cov` persist across iterations, via `bench_common.makeFilter`) --
+// that's fine for every filter type above, since none of them carry any
+// state beyond `x`/`P` (or `L`)/`Q`/`R` between rows. `AdaptiveKalmanFilter`
+// can't use that pattern: its ring buffer of past innovations (see
+// `adaptive_kalman.zig`) has to persist across the *whole* run for the
+// windowing to mean anything, so this keeps one `Filter` value alive for the
+// entire loop instead, updating it in place.
+const BicycleKind = filter_union.FilterKind(4, 3, 2, gps_ins.GpsModel, 3);
+
+fn AdaptiveBicycle(comptime config: adaptive_kalman.Config) type {
+    return adaptive_kalman.AdaptiveKalmanFilter(4, 3, 2, BicycleKind, config);
+}
+
+fn runBicycleAdaptive(comptime config: adaptive_kalman.Config, io: Io, q_floor: f64, q_ceiling: f64) !BenchResult {
+    const Filter = AdaptiveBicycle(config);
+    var filt: Filter = undefined;
+    var initialized = false;
+    var prev_t: f64 = 0;
+    var acc = ErrorAccumulator{};
+
+    const floor_vec: gps_ins.StateVec = blk: {
+        var v = gps_ins.StateVec.zero();
+        for (0..4) |i| v.data[i][0] = q_floor;
+        break :blk v;
+    };
+    const ceiling_vec: gps_ins.StateVec = blk: {
+        var v = gps_ins.StateVec.zero();
+        for (0..4) |i| v.data[i][0] = q_ceiling;
+        break :blk v;
+    };
+
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        if (line.len == 0) continue;
+
+        var fields = std.mem.tokenizeScalar(u8, line, '\t');
+        const t = try std.fmt.parseFloat(f64, fields.next().?);
+        const gps_px = try std.fmt.parseFloat(f64, fields.next().?);
+        const gps_py = try std.fmt.parseFloat(f64, fields.next().?);
+        const af = try std.fmt.parseFloat(f64, fields.next().?);
+        const wu = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_px = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_py = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_v = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_yaw = try std.fmt.parseFloat(f64, fields.next().?);
+
+        if (!initialized) {
+            filt = .{
+                .active = .{ .ekf = BicycleEKF{
+                    .x = blk: {
+                        var m = gps_ins.StateVec.zero();
+                        m.data[0][0] = gps_px;
+                        m.data[1][0] = gps_py;
+                        break :blk m;
+                    },
+                    .P = blk: {
+                        var m = gps_ins.StateMat.zero();
+                        m.data[0][0] = 1;
+                        m.data[1][1] = 1;
+                        m.data[2][2] = 1000;
+                        m.data[3][3] = 1000;
+                        break :blk m;
+                    },
+                    // Seed Q: same untuned std_af/std_wu as the "EKF untuned"
+                    // column, evaluated at the dataset's nominal ~0.1s sample
+                    // period (dt isn't known yet at construction time, and
+                    // unlike every other filter here, this Q won't be
+                    // recomputed from the *actual* per-row dt below -- see
+                    // the note in the loop.
+                    .Q = gps_ins.processNoise(0.1, ekf_std_af_untuned, ekf_std_wu_untuned),
+                    .R = blk: {
+                        var m = gps_ins.GpsNoise.zero();
+                        m.data[0][0] = gps_noise_var;
+                        m.data[1][1] = gps_noise_var;
+                        break :blk m;
+                    },
+                } },
+                .q_floor = floor_vec,
+                .q_ceiling = ceiling_vec,
+            };
+            prev_t = t;
+            initialized = true;
+            continue;
+        }
+
+        const dt = t - prev_t;
+        prev_t = t;
+
+        var u = gps_ins.ControlVec.zero();
+        u.data = .{ .{af}, .{wu}, .{dt} };
+
+        // Unlike runBicyclePair, Q is *not* recomputed from dt each step:
+        // AdaptiveKalmanFilter owns Q once the ring buffer fills (see
+        // adaptive_kalman.zig) and overwrites it wholesale from innovation
+        // statistics, blind to the physically-motivated dt-scaling the other
+        // filters get from gps_ins.processNoise(dt, ...) every row. That's a
+        // real gap, not an oversight -- see Readme.md's findings on this
+        // benchmark.
+        const t0 = Io.Timestamp.now(io, .awake);
+        var update_err: ?maryam.EvalError = null;
+        filt.predict(u) catch |e| {
+            update_err = e;
+        };
+        if (update_err == null) {
+            var z = gps_ins.GpsVec.zero();
+            z.data = .{ .{gps_px}, .{gps_py} };
+            filt.update(z) catch |e| {
+                update_err = e;
+            };
+        }
+        const t1 = Io.Timestamp.now(io, .awake);
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
+
+        if (update_err != null) {
+            acc.recordSingular();
+            continue;
+        }
+
+        const x = filt.active.ekf.x;
+        const est_vx = x.data[2][0] * @cos(x.data[3][0]);
+        const est_vy = x.data[2][0] * @sin(x.data[3][0]);
+        const gt_vx = gt_v * @cos(gt_yaw);
+        const gt_vy = gt_v * @sin(gt_yaw);
+        acc.record(.{
+            x.data[0][0] - gt_px,
+            x.data[1][0] - gt_py,
+            est_vx - gt_vx,
+            est_vy - gt_vy,
+        });
+    }
+
+    return acc.finish(@sizeOf(Filter));
+}
+
 pub fn run(w: *Io.Writer, io: Io) !void {
     const linear = try runLinear(io);
     const bicycle_untuned = try runBicyclePair(BicycleEKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
@@ -287,6 +427,15 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     const bicycle_srkf = try runBicyclePair(BicycleSRKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, @sqrt(1000.0));
     const bicycle_eskf = try runBicyclePair(BicycleESKF, io, ekf_std_af_untuned, ekf_std_wu_untuned, 1000);
 
+    // window=20, forgetting_factor=0.02: see Readme.md's Adaptive Kalman
+    // Filter findings -- not tuned to look good, the same configuration
+    // used throughout that investigation. No q_floor/q_ceiling -- same
+    // reasoning as imu_bench.zig's own Adaptive EKF column.
+    // window=20, forgetting_factor=0.02, burn_in=20, huber_threshold=1.5:
+    // see Readme.md's Adaptive Kalman Filter findings -- same configuration
+    // used throughout that investigation, not tuned to look good.
+    const bicycle_adaptive = try runBicycleAdaptive(.{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20, .huber_threshold = 1.5 }, io, 0, std.math.inf(f64));
+
     try w.print("dataset: KITTI 2011_09_26_drive_0005 (real vehicle trajectory, 154 frames @ ~9.6Hz)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, GPS only (no IMU)", linear);
     try report(w, "Bicycle EKF (untuned Q) -- IMU-driven, GPS correction", bicycle_untuned);
@@ -295,17 +444,18 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     try report(w, "Bicycle UKF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_ukf);
     try report(w, "Bicycle SR-KF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_srkf);
     try report(w, "Bicycle ESKF (same Q as untuned EKF) -- IMU-driven, GPS correction", bicycle_eskf);
+    try report(w, "Bicycle Adaptive EKF, window=20 (Q starts at untuned seed, then self-estimated) -- IMU-driven, GPS correction", bicycle_adaptive);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0], bicycle_iekf.rmse[0], bicycle_ukf.rmse[0], bicycle_srkf.rmse[0], bicycle_eskf.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1], bicycle_iekf.rmse[1], bicycle_ukf.rmse[1], bicycle_srkf.rmse[1], bicycle_eskf.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2], bicycle_iekf.rmse[2], bicycle_ukf.rmse[2], bicycle_srkf.rmse[2], bicycle_eskf.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3], bicycle_iekf.rmse[3], bicycle_ukf.rmse[3], bicycle_srkf.rmse[3], bicycle_eskf.rmse[3] });
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF -> Adaptive EKF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], bicycle_untuned.rmse[0], bicycle_alt.rmse[0], bicycle_iekf.rmse[0], bicycle_ukf.rmse[0], bicycle_srkf.rmse[0], bicycle_eskf.rmse[0], bicycle_adaptive.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], bicycle_untuned.rmse[1], bicycle_alt.rmse[1], bicycle_iekf.rmse[1], bicycle_ukf.rmse[1], bicycle_srkf.rmse[1], bicycle_eskf.rmse[1], bicycle_adaptive.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], bicycle_untuned.rmse[2], bicycle_alt.rmse[2], bicycle_iekf.rmse[2], bicycle_ukf.rmse[2], bicycle_srkf.rmse[2], bicycle_eskf.rmse[2], bicycle_adaptive.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], bicycle_untuned.rmse[3], bicycle_alt.rmse[3], bicycle_iekf.rmse[3], bicycle_ukf.rmse[3], bicycle_srkf.rmse[3], bicycle_eskf.rmse[3], bicycle_adaptive.rmse[3] });
 
     if (builtin.os.tag != .windows) {
         const ru = std.posix.getrusage(std.posix.rusage.SELF);
         const peak_kb: i64 = if (builtin.os.tag == .macos) @divTrunc(ru.maxrss, 1024) else ru.maxrss;
-        try w.print("\nprocess peak RSS = {d} KB (whole program, all seven filters + both benchmarks)\n", .{peak_kb});
+        try w.print("\nprocess peak RSS = {d} KB (whole program, all eight filters + both benchmarks)\n", .{peak_kb});
     }
 
     try w.flush();

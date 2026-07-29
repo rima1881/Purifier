@@ -26,6 +26,8 @@ const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
 const error_state_kalman = Purifier.error_state_kalman;
+const filter_union = Purifier.filter_union;
+const adaptive_kalman = Purifier.adaptive_kalman;
 const ctrv = @import("ctrv.zig");
 const cv = @import("constant_velocity.zig");
 const maryam = @import("maryam");
@@ -296,6 +298,173 @@ fn runFilterPair(comptime Lidar: type, comptime Radar: type, io: Io, std_a: f64,
     return acc.finish(@max(@sizeOf(Lidar), @sizeOf(Radar)));
 }
 
+// ---- Adaptive EKF: same CTRV model, but Q is re-estimated online instead of fixed ----
+
+// Unlike runFilterPair above, this can't reconstruct a fresh filter value
+// each row: AdaptiveKalmanFilter's ring buffer of past innovations (see
+// adaptive_kalman.zig) has to persist across the whole run for the
+// windowing to mean anything. Lidar (m=2) and Radar (m=3) still need two
+// separate long-lived instances -- AdaptiveKalmanFilter is generic over one
+// fixed measurement dimension `m`, same structural reason runFilterPair
+// needs two filter *types* -- so `x`/`cov` are copied between them the same
+// way runFilterPair already does, and each instance's own `Q` estimate is
+// additionally copied into the other after every update(): the two only
+// ever see half the rows each (their own sensor type), but the process
+// noise they're both estimating is one and the same physical quantity.
+const LidarAdaptiveKind = filter_union.FilterKind(5, 1, 2, ctrv.LidarModel, 3);
+const RadarAdaptiveKind = filter_union.FilterKind(5, 1, 3, ctrv.RadarModel, 3);
+
+fn LidarAdaptive(comptime config: adaptive_kalman.Config) type {
+    return adaptive_kalman.AdaptiveKalmanFilter(5, 1, 2, LidarAdaptiveKind, config);
+}
+fn RadarAdaptive(comptime config: adaptive_kalman.Config) type {
+    return adaptive_kalman.AdaptiveKalmanFilter(5, 1, 3, RadarAdaptiveKind, config);
+}
+
+fn runAdaptivePair(comptime config: adaptive_kalman.Config, io: Io, std_a: f64, std_yawdd: f64, q_floor: f64, q_ceiling: f64) !BenchResult {
+    const Lidar = LidarAdaptive(config);
+    const Radar = RadarAdaptive(config);
+
+    var x = ctrv.StateVec.zero();
+    var cov = maryam.I(5);
+    const q_seed = ctrv.processNoise(x, 0.05, std_a, std_yawdd); // ~nominal dt for this dataset
+    var initialized = false;
+    var prev_t: i64 = 0;
+    var acc = ErrorAccumulator{};
+
+    // Uniform bounds across all 5 state components -- simple, not
+    // per-component tuned; see the accuracy findings for whether this alone
+    // is enough to help.
+    const floor_vec: ctrv.StateVec = blk: {
+        var v = ctrv.StateVec.zero();
+        for (0..5) |i| v.data[i][0] = q_floor;
+        break :blk v;
+    };
+    const ceiling_vec: ctrv.StateVec = blk: {
+        var v = ctrv.StateVec.zero();
+        for (0..5) |i| v.data[i][0] = q_ceiling;
+        break :blk v;
+    };
+
+    // Both constructed once and mutated in place for the rest of the run --
+    // each one's ring buffer of past innovations only accumulates correctly
+    // if the same value keeps getting predict()/update() called on it, never
+    // rebuilt from scratch (see the comment above this function).
+    var lidar: Lidar = .{
+        .active = .{ .ekf = extended_kalman.ExtendedKalmanFilter(5, 1, 2, ctrv.LidarModel){
+            .x = x,
+            .P = cov,
+            .Q = q_seed,
+            .R = ekf_R_lidar,
+        } },
+        .q_floor = floor_vec,
+        .q_ceiling = ceiling_vec,
+    };
+    var radar: Radar = .{
+        .active = .{ .ekf = extended_kalman.ExtendedKalmanFilter(5, 1, 3, ctrv.RadarModel){
+            .x = x,
+            .P = cov,
+            .Q = q_seed,
+            .R = ekf_R_radar,
+        } },
+        .q_floor = floor_vec,
+        .q_ceiling = ceiling_vec,
+    };
+
+    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        if (line.len == 0) continue;
+
+        var fields = std.mem.tokenizeScalar(u8, line, '\t');
+        const kind = fields.next().?;
+        const is_radar = std.mem.eql(u8, kind, "R");
+        if (!is_radar and !std.mem.eql(u8, kind, "L")) continue;
+
+        const meas1 = try std.fmt.parseFloat(f64, fields.next().?);
+        const meas2 = try std.fmt.parseFloat(f64, fields.next().?);
+        const meas3: f64 = if (is_radar) try std.fmt.parseFloat(f64, fields.next().?) else 0;
+        const t = try std.fmt.parseInt(i64, fields.next().?, 10);
+        const gt_px = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_py = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_vx = try std.fmt.parseFloat(f64, fields.next().?);
+        const gt_vy = try std.fmt.parseFloat(f64, fields.next().?);
+
+        if (!initialized) {
+            if (is_radar) {
+                x.data[0][0] = meas1 * @cos(meas2);
+                x.data[1][0] = meas1 * @sin(meas2);
+            } else {
+                x.data[0][0] = meas1;
+                x.data[1][0] = meas2;
+            }
+            lidar.active.ekf.x = x;
+            radar.active.ekf.x = x;
+            prev_t = t;
+            initialized = true;
+            continue;
+        }
+
+        const dt: f64 = @as(f64, @floatFromInt(t - prev_t)) / 1_000_000.0;
+        prev_t = t;
+        const dt_vec: ctrv.DtVec = .{ .data = .{.{dt}} };
+
+        const t0 = Io.Timestamp.now(io, .awake);
+        var update_err: ?maryam.EvalError = null;
+        if (is_radar) {
+            radar.active.ekf.x = x;
+            radar.active.ekf.P = cov;
+            radar.predict(dt_vec) catch |e| {
+                update_err = e;
+            };
+            if (update_err == null) {
+                var z = ctrv.RadarVec.zero();
+                z.data = .{ .{meas1}, .{meas2}, .{meas3} };
+                radar.update(z) catch |e| {
+                    update_err = e;
+                };
+            }
+            x = radar.active.ekf.x;
+            cov = radar.active.ekf.P;
+            lidar.active.ekf.Q = radar.active.ekf.Q; // shared physical process noise, see comment above
+        } else {
+            lidar.active.ekf.x = x;
+            lidar.active.ekf.P = cov;
+            lidar.predict(dt_vec) catch |e| {
+                update_err = e;
+            };
+            if (update_err == null) {
+                var z = ctrv.LidarVec.zero();
+                z.data = .{ .{meas1}, .{meas2} };
+                lidar.update(z) catch |e| {
+                    update_err = e;
+                };
+            }
+            x = lidar.active.ekf.x;
+            cov = lidar.active.ekf.P;
+            radar.active.ekf.Q = lidar.active.ekf.Q; // shared physical process noise, see comment above
+        }
+        const t1 = Io.Timestamp.now(io, .awake);
+        acc.filter_ns += t0.durationTo(t1).nanoseconds;
+
+        if (update_err != null) {
+            acc.recordSingular();
+            continue;
+        }
+
+        const est_vx = x.data[2][0] * @cos(x.data[3][0]);
+        const est_vy = x.data[2][0] * @sin(x.data[3][0]);
+        acc.record(.{
+            x.data[0][0] - gt_px,
+            x.data[1][0] - gt_py,
+            est_vx - gt_vx,
+            est_vy - gt_vy,
+        });
+    }
+
+    return acc.finish(@max(@sizeOf(Lidar), @sizeOf(Radar)));
+}
+
 pub fn run(w: *Io.Writer, io: Io) !void {
     const linear = try runLinear(io);
     const ekf_untuned = try runFilterPair(LidarEKF, RadarEKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
@@ -311,6 +480,16 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     // above: isolates exactly what ErrorStateKalmanFilter changes (state
     // composition through ctrv.inject) rather than also varying Q.
     const eskf = try runFilterPair(LidarESKF, RadarESKF, io, ekf_std_a_untuned, ekf_std_yawdd_untuned);
+    // window=20, forgetting_factor=0.02: see Readme.md's Adaptive Kalman
+    // Filter findings -- not tuned to look good, the same configuration
+    // used throughout that investigation. No q_floor/q_ceiling: see the
+    // findings for why combining the diagonal-only clamp with anything but
+    // a very small forgetting_factor can produce an invalid (non-PSD) Q and
+    // diverge catastrophically.
+    // window=20, forgetting_factor=0.02, burn_in=20, huber_threshold=1.5:
+    // see Readme.md's Adaptive Kalman Filter findings -- not tuned to look
+    // good, the same configuration used throughout that investigation.
+    const adaptive = try runAdaptivePair(.{ .window = 20, .forgetting_factor = 0.02, .burn_in = 20, .huber_threshold = 1.5 }, io, ekf_std_a_untuned, ekf_std_yawdd_untuned, 0, std.math.inf(f64));
 
     try w.print("dataset: 250 lidar rows, 250 radar rows (all filters see the same data)\n\n", .{});
     try report(w, "Linear KF -- constant-velocity model, lidar only", linear);
@@ -320,14 +499,15 @@ pub fn run(w: *Io.Writer, io: Io) !void {
     try report(w, "Unscented KF (same Q as untuned EKF) -- CTRV model, lidar + radar", ukf);
     try report(w, "Square-Root KF (same Q as untuned EKF) -- CTRV model, lidar + radar", srkf);
     try report(w, "Error-State KF (same Q as untuned EKF) -- CTRV model, lidar + radar", eskf);
+    try report(w, "Adaptive EKF, window=20 (Q starts at untuned seed, then self-estimated) -- CTRV model, lidar + radar", adaptive);
 
-    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF --\n", .{});
-    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0], iekf.rmse[0], ukf.rmse[0], srkf.rmse[0], eskf.rmse[0] });
-    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1], iekf.rmse[1], ukf.rmse[1], srkf.rmse[1], eskf.rmse[1] });
-    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2], iekf.rmse[2], ukf.rmse[2], srkf.rmse[2], eskf.rmse[2] });
-    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3], iekf.rmse[3], ukf.rmse[3], srkf.rmse[3], eskf.rmse[3] });
-    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
-        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle, iekf.avg_ns_per_cycle, ukf.avg_ns_per_cycle, srkf.avg_ns_per_cycle, eskf.avg_ns_per_cycle,
+    try w.print("-- comparison: linear -> EKF untuned -> EKF different Q -> IEKF -> UKF -> SR-KF -> ESKF -> Adaptive EKF --\n", .{});
+    try w.print("RMSE px  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[0], ekf_untuned.rmse[0], ekf_alt.rmse[0], iekf.rmse[0], ukf.rmse[0], srkf.rmse[0], eskf.rmse[0], adaptive.rmse[0] });
+    try w.print("RMSE py  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[1], ekf_untuned.rmse[1], ekf_alt.rmse[1], iekf.rmse[1], ukf.rmse[1], srkf.rmse[1], eskf.rmse[1], adaptive.rmse[1] });
+    try w.print("RMSE vx  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[2], ekf_untuned.rmse[2], ekf_alt.rmse[2], iekf.rmse[2], ukf.rmse[2], srkf.rmse[2], eskf.rmse[2], adaptive.rmse[2] });
+    try w.print("RMSE vy  {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4} -> {d:.4}\n", .{ linear.rmse[3], ekf_untuned.rmse[3], ekf_alt.rmse[3], iekf.rmse[3], ukf.rmse[3], srkf.rmse[3], eskf.rmse[3], adaptive.rmse[3] });
+    try w.print("speed    {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle -> {d:.0} ns/cycle\n\n", .{
+        linear.avg_ns_per_cycle, ekf_untuned.avg_ns_per_cycle, ekf_alt.avg_ns_per_cycle, iekf.avg_ns_per_cycle, ukf.avg_ns_per_cycle, srkf.avg_ns_per_cycle, eskf.avg_ns_per_cycle, adaptive.avg_ns_per_cycle,
     });
 
     if (builtin.os.tag != .windows) {

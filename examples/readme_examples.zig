@@ -10,6 +10,8 @@ const iterated_extended_kalman = Purifier.iterated_extended_kalman;
 const unscented_kalman = Purifier.unscented_kalman;
 const square_root_kalman = Purifier.square_root_kalman;
 const error_state_kalman = Purifier.error_state_kalman;
+const filter_union = Purifier.filter_union;
+const adaptive_kalman = Purifier.adaptive_kalman;
 const maryam = @import("maryam");
 
 test "Readme.md: linear KalmanFilter example" {
@@ -337,4 +339,77 @@ test "Readme.md: ErrorStateKalmanFilter example" {
     try filter.update(z);
 
     try std.testing.expect(filter.x.data[0][0] > 0); // moved toward asin(0.5)
+}
+
+test "Readme.md: AdaptiveKalmanFilter example" {
+    // Same h(x) = sin(x) model as the ExtendedKalmanFilter example above,
+    // wrapped in AdaptiveKalmanFilter via filter_union.FilterKind's .ekf tag
+    // instead of driven standalone -- proves the online-Q mechanism isn't
+    // special-cased to the linear filter. Q starts badly wrong (1e-6, far
+    // too small); window=5 means Q gets re-estimated from the actual
+    // innovation sequence once 5 updates have run.
+    const Vec1 = maryam.MatrixType(1, 1);
+
+    const Model = struct {
+        pub fn f(x: Vec1, u: Vec1) Vec1 {
+            var out = x;
+            out.data[0][0] += u.data[0][0];
+            return out;
+        }
+        pub fn jacobianF(x: Vec1, u: Vec1) Vec1 {
+            _ = x;
+            _ = u;
+            var m = Vec1.zero();
+            m.data[0][0] = 1;
+            return m;
+        }
+        pub fn h(x: Vec1) Vec1 {
+            var out = Vec1.zero();
+            out.data[0][0] = @sin(x.data[0][0]);
+            return out;
+        }
+        pub fn jacobianH(x: Vec1) Vec1 {
+            var m = Vec1.zero();
+            m.data[0][0] = @cos(x.data[0][0]);
+            return m;
+        }
+    };
+
+    const Kind = filter_union.FilterKind(1, 1, 1, Model, 1);
+    const AKF = adaptive_kalman.AdaptiveKalmanFilter(1, 1, 1, Kind, .{ .window = 5 });
+
+    var filter = AKF{
+        .active = .{ .ekf = extended_kalman.ExtendedKalmanFilter(1, 1, 1, Model){
+            .x = Vec1.zero(),
+            .P = blk: {
+                var m = Vec1.zero();
+                m.data[0][0] = 1;
+                break :blk m;
+            },
+            .Q = blk: { // deliberately too small -- the point of this filter
+                var m = Vec1.zero();
+                m.data[0][0] = 1e-6;
+                break :blk m;
+            },
+            .R = blk: {
+                var m = Vec1.zero();
+                m.data[0][0] = 0.1;
+                break :blk m;
+            },
+        } },
+    };
+
+    const seed_q = filter.active.ekf.Q.data[0][0];
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try filter.predict(Vec1.zero());
+        var z = Vec1.zero();
+        z.data[0][0] = if (i % 2 == 0) 0.9 else -0.9; // sustained, large innovations
+        try filter.update(z);
+    }
+
+    // After enough updates, Q has been re-estimated from the actual
+    // innovation sequence instead of staying at the badly-guessed seed.
+    try std.testing.expect(filter.active.ekf.Q.data[0][0] > seed_q * 100);
 }

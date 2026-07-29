@@ -24,6 +24,17 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
         H: Core.MeasureMat, // (m x n) Measurement transition
         R: Core.MeasureNoise, // (m x m) Measurement noise
 
+        // Recorded by the most recent update() -- not meaningful to a
+        // typical caller directly, but lets a generic wrapper (see
+        // `filter_union.FilterKind`/`adaptive_kalman.AdaptiveKalmanFilter`)
+        // recover "the gain, residual, and innovation covariance this step
+        // actually used" without re-deriving filter-specific math
+        // (Jacobian-based here, sigma-point or QR-based for other variants)
+        // itself.
+        last_K: Core.GainMat = undefined,
+        last_y: Core.MeasureVec = undefined,
+        last_S: Core.MeasureNoise = undefined,
+
         // Symbolic Equations specific to the *linear* model (Core covers
         // everything shared with other filter variants).
         const PredictX = maryam.Equation("F @ x + B @ u", struct {
@@ -49,6 +60,9 @@ pub fn KalmanFilter(comptime n: usize, comptime k: usize, comptime m: usize) typ
             const y = Innovation.eval(.{ .z = z, .H = self.H, .x = self.x });
             self.x = Core.ApplyGain.eval(.{ .x = self.x, .K = K, .y = y });
             self.P = Core.UpdateP.eval(.{ .I = maryam.I(n), .K = K, .H = self.H, .P = self.P, .R = self.R });
+            self.last_K = K;
+            self.last_y = y;
+            self.last_S = S;
         }
     };
 }
